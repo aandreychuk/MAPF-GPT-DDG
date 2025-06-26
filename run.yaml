@@ -1,0 +1,18 @@
+container:
+  image: "mapf-gpt:latest"
+  command: /opt/conda/envs/pogema/bin/python3 example.py
+  tty: True
+  environment:
+    - "OMP_NUM_THREADS=32"
+    - "MKL_NUM_THREADS=1"
+    - "OPENBLAS_NUM_THREADS=1"
+    - "NVIDIA_VISIBLE_DEVICES=0"
+code:
+  volumes: []
+  folder: "."
+  forward_environment_keys: [ "WANDB_API_KEY" ]
+  ignore: [ ".git" ]
+host_config:
+  runtime: nvidia
+  shm_size: '8g'
+  mem_limit: '128g'
