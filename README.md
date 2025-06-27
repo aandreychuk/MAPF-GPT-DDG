@@ -62,6 +62,7 @@ python3 benchmark.py
 ```
 
 The results will be stored in the `eval_configs` folder near the corresponding configs. They can also be logged into wandb. The tables with average success rates will be displayed directly in the console.
+You can also find the results (raw data and scripts to build plots) presented in the paper in the [metrics](https://github.com/Cognitive-AI-Systems/MAPF-GPT-DDG/tree/metrics) branch.
 
 ## Dataset
 
