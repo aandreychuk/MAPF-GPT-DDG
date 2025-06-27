@@ -1,15 +1,10 @@
-import argparse
 from pathlib import Path
 import random
 import time
 from tqdm.auto import tqdm
 
-import torch
-import yaml
 from pogema_toolbox.create_env import Environment
 
-from pogema_toolbox.registry import ToolboxRegistry
-from pogema import AnimationConfig
 from create_env import create_eval_env
 from gpt.inference import MAPFGPTInference, MAPFGPTInferenceConfig
 from pogema_toolbox.results_holder import ResultsHolder
@@ -28,8 +23,7 @@ def run_episode(env, algo):
     algo.reset_states()
     results_holder = ResultsHolder()
 
-    obs, _ = env.reset()#seed=env.grid_config.seed)
-#    while True:
+    obs, _ = env.reset()
     for _ in tqdm(range(env.grid.config.max_episode_steps), desc="Running episode"):
         obs, rew, terminated, truncated, infos = env.step(algo.act(obs))
         results_holder.after_step(infos)
@@ -46,7 +40,7 @@ def main():
         start_xy.add((random.randint(0, size-1), random.randint(0, size-1)))
     start_xy = list(start_xy)
     
-    delta = 64
+    delta = 64 # max distance between start and goal
     goal_xy = []
     used_goals = set()  # Track already used goal positions
     
@@ -79,7 +73,7 @@ def main():
 
         env = create_eval_env(env_cfg)
         create_time = time.time()
-        algo = MAPFGPTInference(MAPFGPTInferenceConfig(path_to_weights=f'weights/model-2M-empty.pt', device='cuda'))
+        algo = MAPFGPTInference(MAPFGPTInferenceConfig(path_to_weights=f'hf_weights/model-2M-DDG.pt', device='cuda'))
         algo.reset_states()
         results = run_episode(env, algo)
         end_time = time.time()
