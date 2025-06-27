@@ -561,11 +561,26 @@ PYBIND11_MODULE(observation_generator, m)
         .def("update_agents", &ObservationGenerator::update_agents)
         .def("generate_observations", &ObservationGenerator::generate_observations);
 }
-/*
 <%
-cfg['extra_compile_args'] = ['-std=c++17', '-fopenmp', '-m64']
-cfg['extra_link_args'] = ['-m64']
+import platform
+import os
+
+# Cross-platform OpenMP configuration
+if platform.system() == 'Darwin':  # macOS
+    if os.path.exists('/opt/homebrew/opt/libomp'):  # Apple Silicon (M1/M2)
+        cfg['extra_compile_args'] = ['-std=c++17', '-Xpreprocessor', '-fopenmp', '-m64', '-I/opt/homebrew/opt/libomp/include']
+        cfg['extra_link_args'] = ['-L/opt/homebrew/opt/libomp/lib', '-lomp', '-m64']
+    elif os.path.exists('/usr/local/opt/libomp'):  # Intel Mac
+        cfg['extra_compile_args'] = ['-std=c++17', '-Xpreprocessor', '-fopenmp', '-m64', '-I/usr/local/opt/libomp/include']
+        cfg['extra_link_args'] = ['-L/usr/local/opt/libomp/lib', '-lomp', '-m64']
+    else:
+        # Fallback for macOS without homebrew OpenMP
+        cfg['extra_compile_args'] = ['-std=c++17', '-m64']
+        cfg['extra_link_args'] = ['-m64']
+else:  # Linux and other Unix systems
+    cfg['extra_compile_args'] = ['-std=c++17', '-fopenmp', '-m64']
+    cfg['extra_link_args'] = ['-fopenmp', '-m64']
+
 setup_pybind11(cfg)
 %>
-*/
 #endif
