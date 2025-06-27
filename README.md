@@ -6,17 +6,17 @@
 
 ---
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/CognitiveAISystems/MAPF-GPT/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/CognitiveAISystems/MAPF-GPT-DDG/blob/main/LICENSE)
 [![Hugging Face](https://img.shields.io/badge/Weights-MAPF--GPT-blue?logo=huggingface)](https://huggingface.co/aandreychuk/MAPF-GPT/tree/main)
 [![Hugging Face](https://img.shields.io/badge/Dataset-MAPF--GPT-blue?logo=huggingface)](https://huggingface.co/datasets/aandreychuk/MAPF-GPT/tree/main)
 </div>
 
-The repository is based on the repository of original MAPF-GPT. It consists of the following crucial parts:
+The repository is based on the repository of original [MAPF-GPT](https://github.com/CognitiveAISystems/MAPF-GPT). It consists of the following crucial parts:
 
-- `example.py` - an example of code to run the MAPF-GPT approach.
-- `benchmark.py` - a script that launches the evaluation of the MAPF-GPT model on the POGEMA benchmark set of maps.
+- `example.py` - an example of code to run the MAPF-GPT-DDG approach.
+- `benchmark.py` - a script that launches the evaluation of the MAPF-GPT-DDG model on the POGEMA benchmark set of maps.
 - `download_dataset.py` - a script that downloads 1B training dataset and 1M validation one. The dataset is uploaded to Hugging Face.
-- `train.py` - a script that launches the training of the MAPF-GPT model.
+- `train.py` - a script that launches the training of the MAPF-GPT-DDG model.
 - `eval_configs` - a folder that contains configs from the POGEMA benchmark. Required by the `benchmark.py` script.
 - `ckpt_configs` - a folder that contains configs used for validation of intermidiate checkpoints used in ablation study.
 
@@ -55,7 +55,7 @@ In addition to statistics about SoC, success rate, etc., you will also get an SV
 ## Running evaluation
 
 You can run the `benchmark.py` script, which will run both MAPF-GPT-2M and MAPF-GPT-DDG-2M models on all the scenarios from the POGEMA benchmark.
-You can also run the MAPF-GPT-85M model by setting `path_to_weights` to `weights/model-85M.pt`. The weights for all models will be downloaded automatically.
+You can also run the MAPF-GPT-85M model by setting `path_to_weights` to `hf_weights/model-85M.pt`. The weights for all models will be downloaded automatically.
 
 ```
 python3 benchmark.py
