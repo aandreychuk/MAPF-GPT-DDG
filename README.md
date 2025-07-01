@@ -84,5 +84,11 @@ torchrun --standalone --nproc_per_node=1 train.py gpt/config-2M-DDG.py
 ## Citation:
 
 ```bibtex
-TODO
+@article{andreychuk2025advancing,
+  title={Advancing Learnable Multi-Agent Pathfinding Solvers with Active Fine-Tuning},
+  author={Anton Andreychuk and Konstantin Yakovlev and Aleksandr Panov and Alexey Skrynnik},
+  journal={arXiv preprint arXiv:2506.23793},
+  year={2025},
+  url={https://arxiv.org/abs/2506.23793}
+}
 ```
