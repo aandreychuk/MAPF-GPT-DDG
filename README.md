@@ -5,10 +5,11 @@
 <div align="center" dir="auto">
 
 ---
-
+[![arXiv](https://img.shields.io/badge/arXiv-2506.23793-b31b1b.svg)](https://arxiv.org/abs/2506.23793)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/CognitiveAISystems/MAPF-GPT-DDG/blob/main/LICENSE)
 [![Hugging Face](https://img.shields.io/badge/Weights-MAPF--GPT-blue?logo=huggingface)](https://huggingface.co/aandreychuk/MAPF-GPT/tree/main)
 [![Hugging Face](https://img.shields.io/badge/Dataset-MAPF--GPT-blue?logo=huggingface)](https://huggingface.co/datasets/aandreychuk/MAPF-GPT/tree/main)
+[![Hugging Face](https://img.shields.io/badge/Dataset-MAPF--GPT--DDG-blue?logo=huggingface)](https://huggingface.co/datasets/aandreychuk/MAPF-GPT-DDG/tree/main)
 </div>
 
 The repository is based on the repository of original [MAPF-GPT](https://github.com/CognitiveAISystems/MAPF-GPT). It consists of the following crucial parts:
