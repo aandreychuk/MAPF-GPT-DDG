@@ -14,22 +14,12 @@ from gpt.observation_generator import ObservationGenerator, InputParameters
 
 class MAPFGPTInferenceConfig(AlgoBase, extra=Extra.forbid):
     name: Literal["MAPF-GPT"] = "MAPF-GPT"
-    num_agents: int = 13
-    num_previous_actions: int = 5
-    cost2go_value_limit: int = 20
-    agents_radius: int = 5
-    cost2go_radius: int = 5
+    context_size: int = 128
+    obs_radius: int = 5
     path_to_weights: Optional[str] = "hf_weights/model-2M-DDG.pt"
-    device: str = "cuda"
-    context_size: int = 256
-    mask_actions_history: bool = False
-    mask_goal: bool = False
-    mask_cost2go: bool = False
-    mask_greed_action: bool = False
     repo_id: str = 'aandreychuk/MAPF-GPT'
-    grid_step: int = 64
-    save_cost2go: bool = False
     batch_size: int = 2048
+    device: str = "cuda"
     num_process: int = 8
 
 def strip_prefix_from_state_dict(state_dict, prefix="_orig_mod."):
@@ -49,16 +39,6 @@ def strip_prefix_from_state_dict(state_dict, prefix="_orig_mod."):
 class MAPFGPTInference:
     def __init__(self, cfg: MAPFGPTInferenceConfig, net=None):
         self.cfg: MAPFGPTInferenceConfig = cfg
-        self.input_parameters = InputParameters(
-            cfg.cost2go_value_limit,
-            cfg.num_agents,
-            cfg.num_previous_actions,
-            cfg.context_size,
-            cfg.cost2go_radius,
-            cfg.agents_radius,
-            cfg.grid_step,
-            cfg.save_cost2go
-        )
         self.observation_generator = None
         self.last_actions = None
 
@@ -94,7 +74,8 @@ class MAPFGPTInference:
             positions = [obs["global_xy"] for obs in observations]
             goals = [obs["global_target_xy"] for obs in observations]
             if self.observation_generator is None:
-                self.observation_generator = ObservationGenerator(observations[0]["global_obstacles"].copy().astype(int).tolist(), self.input_parameters)
+                grid = observations[0]["global_obstacles"].copy().astype(int).tolist()
+                self.observation_generator = ObservationGenerator(grid, self.cfg.obs_radius, self.cfg.context_size)
                 self.observation_generator.create_agents(positions, goals)
                 self.last_actions = [-1 for _ in range(len(observations))]
             self.observation_generator.update_agents(positions, goals, self.last_actions)

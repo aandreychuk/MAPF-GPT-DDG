@@ -18,8 +18,6 @@ from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from gpt.model import GPT, GPTConfig
-from tokenizer.parameters import InputParameters
-from tokenizer.tokenizer import Tokenizer
 from dagger import run_dagger
 from gpt.aggregated_data_loader import AggregatedMapfArrowDataset
 import torch._dynamo
@@ -83,7 +81,7 @@ device_id = 0
 file_size = 50 * 2 ** 11
 max_ratio = 0.25
 
-train_data_files = ["dataset/train", f"dataset/{dagger_type}"]
+train_data_files = ["dataset/mazes", f"dataset/random"]
 valid_data_file = "dataset/validation"
 
 # -----------------------------------------------------------------------------
@@ -120,7 +118,7 @@ current_train_index = 0
 current_valid_index = 0
 
 seed = 1000
-train_data = MapfArrowDataset(train_data_files[0], device=device, batch_size=batch_size)
+train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
 val_data = MapfArrowDataset(valid_data_file, device=device, batch_size=batch_size)
 
 train_data_iter = iter(train_data)
@@ -183,9 +181,6 @@ ctx = (
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
-cfg = InputParameters()
-tokenizer = Tokenizer(cfg)
-
 
 def get_batch(data):
     x, y = next(data)
@@ -197,7 +192,7 @@ def get_batch(data):
 iter_num = 0
 best_val_loss = 1e9
 
-meta_vocab_size = len(tokenizer.encoder.vocab)
+meta_vocab_size = 97
 
 # model init
 model_args = dict(
@@ -376,7 +371,7 @@ while True:
     if iter_num % eval_interval == 0:
         torch.distributed.barrier()
         if dagger_type == 'standard':
-            train_data = MapfArrowDataset(train_data_files[0], device=device, batch_size=batch_size)
+            train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
         else:
             batch_sizes = get_batch_ratios(iter_num - start_iter_num, max_ratio=max_ratio)
             train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
