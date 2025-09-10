@@ -40,6 +40,7 @@ wandb_run_name = None  # name of the run to resume
 
 gradient_accumulation_steps = 16  # used to simulate larger batch sizes
 batch_size = 64  # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_sizes = [116, 12]
 block_size = 256
 # model
 n_layer = 2
@@ -192,7 +193,7 @@ def get_batch(data):
 iter_num = 0
 best_val_loss = 1e9
 
-meta_vocab_size = 97
+meta_vocab_size = 98
 
 # model init
 model_args = dict(

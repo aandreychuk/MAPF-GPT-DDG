@@ -9,7 +9,7 @@ from pogema_toolbox.registry import ToolboxRegistry
 from pydantic import Extra
 
 from gpt.model import GPT, GPTConfig
-from gpt.observation_generator import ObservationGenerator, InputParameters
+from gpt.observation_generator import ObservationGenerator
 
 
 class MAPFGPTInferenceConfig(AlgoBase, extra=Extra.forbid):

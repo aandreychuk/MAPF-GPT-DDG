@@ -107,7 +107,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 128
-    vocab_size: int = 97
+    vocab_size: int = 98
     n_layer: int = 8
     n_head: int = 8
     n_embd: int = 256

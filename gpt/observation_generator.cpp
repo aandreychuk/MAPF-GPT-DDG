@@ -44,7 +44,7 @@ void ObservationGenerator::compute_cost2go_for_goal(const std::pair<int, int> &g
             }
             else
             {
-                direction_matrix[i][j] = compute_direction_flags(cost_matrix, i, j) + 1;
+                direction_matrix[i][j] = compute_direction_flags(cost_matrix, i, j) + 1; //TODO: remove redundant +1
             }
         }
     }
