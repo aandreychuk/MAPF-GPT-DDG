@@ -4,6 +4,7 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import glob
+from lacam.inference import LacamInference, LacamInferenceConfig # to force compilation of lacam
 
 def run_dagger(dagger_type, num_workers, device_id, seed, file_size, run_infinite=False):
     def run_worker(worker_id):

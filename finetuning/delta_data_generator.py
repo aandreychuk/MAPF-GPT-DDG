@@ -21,7 +21,7 @@ from multiprocessing import Pool
 from lacam.inference import LacamInference, LacamInferenceConfig
 from pogema.wrappers.metrics import RuntimeMetricWrapper
 from macro_env import PogemaMacroEnvironment, MAPFGPTObservationWrapper
-from gpt.observation_generator import ObservationGenerator, InputParameters
+from gpt.observation_generator import ObservationGenerator
 
 class FastSolverDeltaConfig(BaseModel):
     steps_delta: int = 16
@@ -48,10 +48,10 @@ def run_episode_macro(env, algo):
             break
     return [info[0]['metrics'] for info in infos]
 
-def run_expert(env, unroll_steps, steps_saved, chosen_agents, time_limit):
+def run_expert(env, unroll_steps, steps_saved, time_limit):
     env = deepcopy(env)
     solver = LacamInference(LacamInferenceConfig(time_limit=time_limit, timeouts=[time_limit]))
-    input, gt_action, metrics = fill_actions_with_solver(env, unroll_steps, steps_saved, chosen_agents, solver)
+    input, gt_action, metrics = fill_actions_with_solver(env, unroll_steps, steps_saved, solver)
     if metrics is not None:
         metrics['step'] = unroll_steps
         metrics['map_name'] = env.grid.config.map_name
@@ -88,8 +88,7 @@ def fast_solver_delta(envs, learnable_algo, fast_solver, solver, cfg: FastSolver
         if cfg.save_debug_svg:
             env = AnimationMonitor(env, AnimationConfig(save_every_idx_episode=None))
         obs, _ = env.reset(seed=env.grid_config.seed)
-        obs_generator = ObservationGenerator(obs[0]["global_obstacles"].copy().astype(int).tolist(), 
-                                             InputParameters(20, 13, 5, 256, 5, 5, 64, False))
+        obs_generator = ObservationGenerator(obs[0]["global_obstacles"].copy().astype(int).tolist(), 5, 128)
         obs_generator.create_agents([o["global_xy"] for o in obs], [o["global_target_xy"] for o in obs])
         env = UnrollWrapper(env)
         env = MAPFGPTObservationWrapper(env, obs_generator)
@@ -133,11 +132,10 @@ def fast_solver_delta(envs, learnable_algo, fast_solver, solver, cfg: FastSolver
         if diffs_by_map[env.grid.config.map_name][max_diff_indices[env.grid.config.map_name]] > cfg.diff_threshold:
             env.set_unroll_steps(cfg.steps_delta*max_diff_indices[env.grid.config.map_name])
             envs_with_positive_diffs.append((env, cfg.steps_delta*max_diff_indices[env.grid.config.map_name]))
-    chosen_agents = list(range(env.grid.config.num_agents))
     ToolboxRegistry.debug(f'Makespan difference: {diffs_by_map}')
     with Pool(processes=8) as pool:
         expert_results = pool.starmap(run_expert, 
-            [(env, unroll_steps, cfg.steps_saved, chosen_agents, 10) for env, unroll_steps in envs_with_positive_diffs])
+            [(env, unroll_steps, cfg.steps_saved, 10) for env, unroll_steps in envs_with_positive_diffs])
         
     inputs = []
     gt_actions = []

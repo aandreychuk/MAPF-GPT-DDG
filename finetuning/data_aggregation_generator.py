@@ -25,9 +25,8 @@ def run_solver(env, unroll_steps, steps_saved):
     env = deepcopy(env)
     solver = LacamInference(LacamInferenceConfig(time_limit=10, timeouts=[10]))
     env.set_unroll_steps(unroll_steps)
-    chosen_agents = list(range(env.grid_config.num_agents))
     ToolboxRegistry.debug(f'Collecting data from step {unroll_steps} to {unroll_steps + steps_saved}')
-    input, gt_action, metrics = fill_actions_with_solver(env, unroll_steps, steps_saved, chosen_agents, solver)
+    input, gt_action, metrics = fill_actions_with_solver(env, unroll_steps, steps_saved, solver)
     return input, gt_action, metrics
 
 def data_aggregation(env, learnable_algo, cfg: DataAggregationConfig):

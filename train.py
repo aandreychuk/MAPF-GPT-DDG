@@ -389,8 +389,8 @@ while True:
         if dagger_type == 'standard':
             train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
         else:
-            batch_sizes = get_batch_ratios(iter_num - start_iter_num, batch_sizes=batch_sizes[:len(train_data_files)-1], max_ratio=max_ratio)
-            train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
+            batch_sizes_with_dagger = get_batch_ratios(iter_num - start_iter_num, batch_sizes=batch_sizes, max_ratio=max_ratio)
+            train_data = AggregatedMapfArrowDataset(train_data_files + [f"dataset/{dagger_type}"], device=device, batch_sizes=batch_sizes_with_dagger)
         train_data_iter = iter(train_data)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
