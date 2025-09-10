@@ -82,7 +82,7 @@ device_id = 0
 file_size = 50 * 2 ** 11
 max_ratio = 0.25
 
-train_data_files = ["dataset/mazes", f"dataset/random"]
+train_data_files = ["dataset/mazes", "dataset/random"]
 valid_data_file = "dataset/validation"
 
 # -----------------------------------------------------------------------------
@@ -134,17 +134,32 @@ def calculate_epochs(max_iters, dataset_size, batch_size, gradient_accumulation_
 
     return num_epochs
 
-def get_batch_ratios(current_iter, min_ratio=0.001, max_ratio=0.25):
+def get_batch_ratios(current_iter, batch_sizes=None, min_ratio=0.001, max_ratio=0.25):
     dataset2_size = (current_iter//eval_interval + 1) * num_workers * file_size
-    samples_per_iter = gradient_accumulation_steps*batch_size*eval_interval
+    total_batch_size = sum(batch_sizes)
+    samples_per_iter = gradient_accumulation_steps * total_batch_size * eval_interval
     ratio = dataset2_size / samples_per_iter
-    
+
     ratio = min(max(ratio, min_ratio), max_ratio)
-    
-    dataset2_samples = int(batch_size * ratio)
-    dataset1_samples = batch_size - dataset2_samples
-    
-    return dataset1_samples, dataset2_samples
+
+    # Calculate dagger-generated dataset batch size
+    dagger_batch_size = int(total_batch_size * ratio)
+
+    # Reduce original batch sizes proportionally to make room for dagger
+    remaining_ratio = 1.0 - ratio
+    adjusted_batch_sizes = [int(bs * remaining_ratio) for bs in batch_sizes]
+
+    # Ensure at least 1 sample per dataset to avoid empty batches
+    adjusted_batch_sizes = [max(1, bs) for bs in adjusted_batch_sizes]
+
+    # Adjust the last original batch size to ensure total matches original
+    current_total = sum(adjusted_batch_sizes) + dagger_batch_size
+    if current_total != total_batch_size:
+        diff = total_batch_size - current_total
+        adjusted_batch_sizes[0] += diff
+
+    # Return single list: adjusted original batch sizes + dagger batch size
+    return adjusted_batch_sizes + [dagger_batch_size]
 
 def human_readable_size(size):
     for unit in ["pairs", "K pairs", "M pairs", "B pairs"]:
@@ -374,7 +389,7 @@ while True:
         if dagger_type == 'standard':
             train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
         else:
-            batch_sizes = get_batch_ratios(iter_num - start_iter_num, max_ratio=max_ratio)
+            batch_sizes = get_batch_ratios(iter_num - start_iter_num, batch_sizes=batch_sizes[:len(train_data_files)-1], max_ratio=max_ratio)
             train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
         train_data_iter = iter(train_data)
 

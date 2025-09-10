@@ -10,7 +10,7 @@ def run_dagger(dagger_type, num_workers, device_id, seed, file_size, run_infinit
         if 'warehouse' in dagger_type:
             subprocess.run(f"python worker.py --worker_id {worker_id} --device_id {device_id} --map_seed {0} --scenario_seed {seed + worker_id * 1000} --dataset_path {path_to_dataset} --dagger_type {dagger_type} --path_to_weights {path_to_weights} --num_agents {','.join(map(str, [32, 64, 96, 128, 160, 192]))} --file_size {file_size}", shell=True)
         else:
-            subprocess.run(f"python worker.py --worker_id {worker_id} --device_id {device_id} --map_seed {seed + worker_id * 1000} --scenario_seed {0} --dataset_path {path_to_dataset} --dagger_type {dagger_type} --path_to_weights {path_to_weights} --file_size {file_size}", shell=True)
+            subprocess.run(f"python worker.py --worker_id {worker_id} --device_id {device_id} --map_seed {seed + worker_id * 1000} --scenario_seed {0} --dataset_path {path_to_dataset} --dagger_type {dagger_type} --path_to_weights {path_to_weights} --num_agents {','.join(map(str, [32, 48, 64]))} --file_size {file_size}", shell=True)
     
     path_to_weights = f"out/ckpt_{dagger_type}.pt"
     path_to_dataset = f"dataset/{dagger_type}"

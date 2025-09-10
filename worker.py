@@ -17,7 +17,7 @@ EXPERT_LACAM_TIMELIMIT = 10
 EPISODE_LENGTH = 256
 NUM_ENVS = 8
 
-def collect_data(seeds, env_generator, worker_id, device_id, actions_required, dagger_type, on_target, path_to_weights, num_agents, grid=None):
+def collect_data(seeds, env_generator, worker_id, device_id, actions_required, dagger_type, on_target, path_to_weights, num_agents, grid=None, balanced=False):
     inputs = []
     gt_actions = []
     actions_counters = [0 for _ in range(5)]
@@ -60,17 +60,21 @@ def collect_data(seeds, env_generator, worker_id, device_id, actions_required, d
             gt_actions.extend(data['gt_actions'])
             actions_counters = [actions_counters[i] + data['gt_actions'].count(i) for i in range(5)]
         ToolboxRegistry.debug(f"Collected {len(inputs)} pairs by worker {worker_id}, current min actions: {min(actions_counters)}, action with min count: {actions_counters.index(min(actions_counters))}, actions required: {actions_required}")
-        if min(actions_counters) >= actions_required:
+        if (balanced and min(actions_counters) >= actions_required) or (not balanced and len(inputs) >= actions_required*5):
             break
     
-    balanced_inputs = []
-    balanced_gt_actions = []
-    actions_counters = [0 for _ in range(5)]
-    for input, gt_action in zip(inputs, gt_actions):
-        if actions_counters[gt_action] < actions_required:
-            actions_counters[gt_action] += 1
-            balanced_inputs.append(input)
-            balanced_gt_actions.append(gt_action)
+    if balanced:
+        balanced_inputs = []
+        balanced_gt_actions = []
+        actions_counters = [0 for _ in range(5)]
+        for input, gt_action in zip(inputs, gt_actions):
+            if actions_counters[gt_action] < actions_required:
+                actions_counters[gt_action] += 1
+                balanced_inputs.append(input)
+                balanced_gt_actions.append(gt_action)
+    else:
+        balanced_inputs = inputs[:actions_required*5]
+        balanced_gt_actions = gt_actions[:actions_required*5]
     
     return balanced_inputs, balanced_gt_actions, logs
 
@@ -88,6 +92,7 @@ def main():
     parser.add_argument('--path_to_weights', type=str, default='out/ckpt.pt', help='Path to the weights (default: %(default)s)')
     parser.add_argument('--dataset_path', type=str, default='dataset/dagger', help='Folder to save the dataset (default: %(default)s)')
     parser.add_argument('--file_size', type=int, default=50 * 2 ** 11, help='File size (default: %(default)d)')
+    parser.add_argument('--balanced', action='store_true', help='Balanced data collection (default: %(default)d)')
     args = parser.parse_args()
     all_logs = []
     num_agents = list(map(int, args.num_agents.split(',')))
@@ -101,7 +106,8 @@ def main():
                                                     dagger_type=args.dagger_type,
                                                     on_target="nothing",
                                                     path_to_weights=args.path_to_weights,
-                                                    num_agents=num_agents)
+                                                    num_agents=num_agents,
+                                                    balanced=args.balanced)
         all_logs.extend(logs)
         random_inputs, random_gt_actions, logs = collect_data(seeds=seeds, 
                                                         env_generator=make_pogema_random_instance, 
@@ -111,7 +117,8 @@ def main():
                                                         dagger_type=args.dagger_type,
                                                         on_target="nothing",
                                                         path_to_weights=args.path_to_weights,
-                                                        num_agents=num_agents)
+                                                        num_agents=num_agents,
+                                                        balanced=args.balanced)
         all_logs.extend(logs)
         balanced_inputs = maze_inputs + random_inputs
         balanced_gt_actions = maze_gt_actions + random_gt_actions
