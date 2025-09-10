@@ -1,19 +1,17 @@
 # noinspection PyUnresolvedReferences
-from gpt.observation_generator import ObservationGenerator, InputParameters
+from gpt.observation_generator import ObservationGenerator
 from pogema_toolbox.registry import ToolboxRegistry
 
 
-def fill_actions_with_solver(env, start_step, steps_to_collect, chosen_agents, expert_algo=None):
+def fill_actions_with_solver(env, start_step, steps_to_collect, expert_algo=None):
     if expert_algo is not None:
         expert_algo.reset_states()
     observations, *_ = env.reset()
-    observation_generator = ObservationGenerator(observations[0]["global_obstacles"].copy().astype(int).tolist(),
-                                                 InputParameters(20, 13, 5, 256, 5, 5, 64, False))
+    observation_generator = ObservationGenerator(observations[0]["global_obstacles"].copy().astype(int).tolist(), 5, 128)
     positions = [obs["global_xy"] for obs in observations]
     goals = [obs["global_target_xy"] for obs in observations]
     observation_generator.create_agents(positions, goals)
-    for i in range(5):
-        observation_generator.update_agents(positions, goals, env.get_actions_at_step(start_step - 5 + i))
+    observation_generator.update_agents(positions, goals, env.get_actions_at_step(start_step - 1))
     inputs = []
     gt_actions = []
     for i in range(steps_to_collect):
@@ -24,7 +22,7 @@ def fill_actions_with_solver(env, start_step, steps_to_collect, chosen_agents, e
                 return None, None, {'ISR': 0.0, 'CSR': 0.0, 'ep_length': 256, 'SoC': -1, 'makespan': 256, 'runtime': 10} # placeholder metrics if expert algo is failed
         else:
             actions = env.get_actions_at_step(start_step + i) # if no expert algo => use the actions from MAPF-GPT
-        for agent_idx in chosen_agents:
+        for agent_idx in range(len(positions)):
             inputs.append(input[agent_idx])
             gt_actions.append(actions[agent_idx])
         observations, rew, terminated, truncated, infos = env.step(actions)
