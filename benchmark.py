@@ -18,7 +18,7 @@ def ensure_weights(eval_config):
         ToolboxRegistry.create_algorithm(algo_cfg['name'], **algo_cfg)
 
 
-def main(disable_wandb=False):
+def main(disable_wandb=True):
     env_cfg_name = "Environment"
     ToolboxRegistry.register_env(env_cfg_name, create_eval_env, Environment)
     ToolboxRegistry.register_algorithm(

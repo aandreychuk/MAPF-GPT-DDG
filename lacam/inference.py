@@ -209,6 +209,35 @@ class LacamInference:
 
         return [agent.get_action() for agent in self.lacam_agents]
 
+    def get_full_solution(self, observations, max_episode_steps):
+        map_array = np.array(observations[0]['global_obstacles'])
+        agent_starts_xy = [obs['global_xy'] for obs in observations]
+        agent_targets_xy = [obs['global_target_xy'] for obs in observations]
+        self.lacam_agents = [LacamAgent(idx) for idx in range(len(observations))]
+        agent_tasks_dict = {}
+        for idx, (start_xy, target_xy) in enumerate(zip(agent_starts_xy, agent_targets_xy)):
+            agent_task = self.lacam_agents[idx].format_task_string(start_xy, target_xy, map_shape=map_array.shape)
+            agent_tasks_dict[idx] = agent_task
+        task_file_content = "version 1\n"
+        for idx in range(len(self.lacam_agents)):
+            task_file_content += agent_tasks_dict[idx]
+        map_row = lambda row: ''.join('@' if x else '.' for x in row)
+        map_content = '\n'.join(map_row(row) for row in map_array)
+        map_file_content = f"type octile\nheight {map_array.shape[0]}\nwidth {map_array.shape[1]}\nmap\n{map_content}"
+        self.solved, lacam_results = self.lacam_lib.run_lacam(map_file_content, task_file_content, len(self.lacam_agents), self.cfg.timeouts)
+        if self.solved:
+            paths = self._parse_data(lacam_results)
+            for idx, agent_path in enumerate(paths):
+                self.lacam_agents[idx].set_path(agent_path)
+            actions = [[agent.get_action() for agent in self.lacam_agents] for _ in range(max_episode_steps)]
+            for i in range(len(actions) - 1, -1, -1):
+                if not all(action == 0 for action in actions[i]):
+                    actions = actions[:i+1]
+                    break
+        else:
+            actions = None
+        return actions, map_array.tolist(), agent_starts_xy, agent_targets_xy
+
     def after_step(self, dones):
         pass
 
