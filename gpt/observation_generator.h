@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <sstream>
 #include <fstream>
-#define PYBIND11_MODULE
+#include <iomanip>
 #ifdef PYBIND11_MODULE
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -57,5 +57,9 @@ public:
     void create_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals);
     void update_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals, const std::vector<int> &actions);
     std::vector<std::vector<int>> generate_observations();
+#ifdef PYBIND11_MODULE
     pybind11::array_t<int> generate_observations_numpy();
+#endif
+    void display_cost2go_matrix(const std::pair<int, int> &goal, bool use_unicode = true);
+    void display_observation(int agent_idx);
 };

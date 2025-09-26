@@ -44,7 +44,7 @@ void ObservationGenerator::compute_cost2go_for_goal(const std::pair<int, int> &g
             }
             else
             {
-                direction_matrix[i][j] = compute_direction_flags(cost_matrix, i, j) + 1; //TODO: remove redundant +1
+                direction_matrix[i][j] = compute_direction_flags(cost_matrix, i, j);// + 1; //TODO: remove redundant +1
             }
         }
     }
@@ -195,14 +195,15 @@ std::vector<std::vector<int>> ObservationGenerator::generate_observations()
     {
         generate_cost2go_obs(i, obs_buffer[i]);
         // Flatten the 2D observation buffer to 1D for this agent
-        observations[i].clear();
+        int idx = 0;
         for (const auto &row : obs_buffer[i])
             for (int value : row)
-                observations[i].push_back(value);
+                observations[i][idx++] = value;
     }
     return observations;
 }
 
+#ifdef PYBIND11_MODULE
 pybind11::array_t<int> ObservationGenerator::generate_observations_numpy()
 {
     int num_agents = agents.size();
@@ -226,20 +227,334 @@ pybind11::array_t<int> ObservationGenerator::generate_observations_numpy()
     
     return result;
 }
+#endif
+
+void ObservationGenerator::display_cost2go_matrix(const std::pair<int, int> &goal, bool use_unicode)
+{
+    // Ensure cost2go is computed for this goal
+    compute_cost2go_for_goal(goal);
+    
+    const auto& direction_matrix = cost2go_cache[goal];
+    
+    // Function to generate a 3x3 cell representation for given direction flags
+    auto generate_3x3_cell = [](int8_t direction_flags, bool is_obstacle) -> std::vector<std::string> {
+        if (is_obstacle) {
+            return {"###", "###", "###"};
+        }
+        
+        if (direction_flags == 0) {
+            return {"...", "...", "..."};
+        }
+        
+        // direction_flags is stored as (actual_flags + 1), so subtract 1
+        int flags = (direction_flags - 1) & 0xF;
+        
+        // Extract individual direction bits based on compute_direction_flags order:
+        // moves = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}} -> up, down, left, right
+        bool up = flags & 1;    // bit 0: up (-1, 0)
+        bool down = flags & 2;  // bit 1: down (1, 0) 
+        bool left = flags & 4;  // bit 2: left (0, -1)
+        bool right = flags & 8; // bit 3: right (0, 1)
+        
+        std::vector<std::string> cell(3, "   ");
+        
+        // Top row
+        cell[0][1] = up ? '^' : ' ';
+        
+        // Middle row
+        cell[1][0] = left ? '<' : ' ';
+        cell[1][1] = ' '; // Center is always empty
+        cell[1][2] = right ? '>' : ' ';
+        
+        // Bottom row
+        cell[2][1] = down ? 'v' : ' ';
+        
+        return cell;
+    };
+    
+    std::cout << "\nCost2Go Matrix with 3x3 Directional Cells for goal (" << goal.first << "," << goal.second << "):\n";
+    std::cout << "Legend: Each cell shows optimal directions as:  ^  \n";
+    std::cout << "                                               < > \n";
+    std::cout << "                                                v  \n";
+    std::cout << "        ### = obstacle, ... = unreachable, empty spaces = no movement in that direction\n\n";
+    
+    // Limit display size for readability
+    int max_display_size = std::min(15, (int)grid.size());
+    int max_display_cols = std::min(15, (int)grid[0].size());
+    
+    // Display column numbers header (each column takes 4 characters including separator)
+    std::cout << "    ";
+    for (int j = 0; j < max_display_cols; j++) {
+        std::cout << std::setw(3) << (j % 10) << "│";
+    }
+    std::cout << "\n";
+    
+    // Display top border
+    std::cout << "   ┌";
+    for (int j = 0; j < max_display_cols; j++) {
+        std::cout << "───" << (j == max_display_cols - 1 ? "┐" : "┬");
+    }
+    std::cout << "\n";
+    
+    // Display the matrix with 3x3 cells and grid lines
+    for (int i = 0; i < max_display_size; i++) {
+        // Each row is displayed as 3 lines (for the 3x3 cells)
+        std::vector<std::vector<std::string>> row_cells;
+        
+        // Generate 3x3 representation for each cell in this row
+        for (int j = 0; j < max_display_cols; j++) {
+            bool is_obstacle = (grid[i][j] != 0);
+            int8_t direction_flags = is_obstacle ? 0 : direction_matrix[i][j];
+            row_cells.push_back(generate_3x3_cell(direction_flags, is_obstacle));
+        }
+        
+        // Print the 3 lines of this row
+        for (int line = 0; line < 3; line++) {
+            if (line == 1) {
+                // Middle line: show row number
+                std::cout << std::setw(2) << (i % 100) << " │";
+            } else {
+                // Top and bottom lines: just spacing
+                std::cout << "   │";
+            }
+            
+            // Print this line for all cells in the row with vertical separators
+            for (const auto& cell : row_cells) {
+                std::cout << cell[line] << "│";
+            }
+            std::cout << "\n";
+        }
+        
+        // Print horizontal separator after each row
+        if (i == max_display_size - 1) {
+            // Bottom border
+            std::cout << "   └";
+            for (int j = 0; j < max_display_cols; j++) {
+                std::cout << "───" << (j == max_display_cols - 1 ? "┘" : "┴");
+            }
+        } else {
+            // Middle separator
+            std::cout << "   ├";
+            for (int j = 0; j < max_display_cols; j++) {
+                std::cout << "───" << (j == max_display_cols - 1 ? "┤" : "┼");
+            }
+        }
+        std::cout << "\n";
+    }
+    
+    // Display goal position
+    std::cout << "\nGoal position: (" << goal.first << "," << goal.second << ")\n";
+    if (max_display_size < grid.size() || max_display_cols < grid[0].size()) {
+        std::cout << "Display limited to " << max_display_size << "x" << max_display_cols << " for readability.\n";
+    }
+}
+
+void ObservationGenerator::display_observation(int agent_idx)
+{
+    if (agent_idx >= agents.size()) {
+        std::cout << "Invalid agent index: " << agent_idx << std::endl;
+        return;
+    }
+    
+    // Generate observation for this agent
+    generate_cost2go_obs(agent_idx, obs_buffer[agent_idx]);
+    
+    const auto& agent = agents[agent_idx];
+    const auto& obs = obs_buffer[agent_idx];
+    int obs_size = 2 * obs_radius + 1;
+    
+    // Function to decode observation value and generate 3x3 cell
+    auto decode_and_generate_cell = [](int obs_value) -> std::vector<std::string> {
+        if (obs_value == 0) {
+            // Obstacle/out of bounds
+            return {"###", "###", "###"};
+        }
+        
+        bool has_agent = false;
+        int direction_flags = 0;
+        
+        if (obs_value >= 17 && obs_value <= 96) {
+            // Agent present: 16 + last_action * 16 + next_action
+            has_agent = true;
+            int agent_info = obs_value - 16;
+            int next_action = agent_info % 16; // Extract next_action
+            direction_flags = next_action; // next_action contains the direction flags (already +1)
+        } else if (obs_value >= 1 && obs_value <= 16) {
+            // Direction only (no agent)
+            direction_flags = obs_value;
+        }
+        
+        // Handle case where direction_flags is 0 (unreachable)
+        if (direction_flags == 0) {
+            return {"...", "...", "..."};
+        }
+        
+        // direction_flags is stored as (actual_flags + 1), so subtract 1
+        int flags = (direction_flags - 1) & 0xF;
+        
+        // Extract individual direction bits based on compute_direction_flags order:
+        // moves = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}} -> up, down, left, right
+        bool up = flags & 1;    // bit 0: up (-1, 0)
+        bool down = flags & 2;  // bit 1: down (1, 0) 
+        bool left = flags & 4;  // bit 2: left (0, -1)
+        bool right = flags & 8; // bit 3: right (0, 1)
+        
+        std::vector<std::string> cell(3, "   ");
+        
+        // Top row
+        cell[0][1] = up ? '^' : ' ';
+        
+        // Middle row
+        cell[1][0] = left ? '<' : ' ';
+        cell[1][1] = has_agent ? 'A' : ' '; // 'A' for agent, space otherwise
+        cell[1][2] = right ? '>' : ' ';
+        
+        // Bottom row
+        cell[2][1] = down ? 'v' : ' ';
+        
+        return cell;
+    };
+    
+    std::cout << "\nObservation Matrix for Agent " << agent_idx << " at (" << agent.pos.first << "," << agent.pos.second << "):\n";
+    std::cout << "Goal: (" << agent.goal.first << "," << agent.goal.second << "), Observation radius: " << obs_radius << "\n";
+    std::cout << "Legend: Each cell shows greedy directions as:  ^  \n";
+    std::cout << "                                              <A> (A = agent present)\n";
+    std::cout << "                                               v  \n";
+    std::cout << "        ### = obstacle, ... = unreachable\n\n";
+    
+    // Display column numbers header
+    std::cout << "    ";
+    for (int j = 0; j < obs_size; j++) {
+        std::cout << std::setw(3) << j << "│";
+    }
+    std::cout << "\n";
+    
+    // Display top border
+    std::cout << "   ┌";
+    for (int j = 0; j < obs_size; j++) {
+        std::cout << "───" << (j == obs_size - 1 ? "┐" : "┬");
+    }
+    std::cout << "\n";
+    
+    // Display the observation matrix with 3x3 cells
+    for (int i = 0; i < obs_size; i++) {
+        // Generate 3x3 representation for each cell in this row
+        std::vector<std::vector<std::string>> row_cells;
+        for (int j = 0; j < obs_size; j++) {
+            row_cells.push_back(decode_and_generate_cell(obs[i][j]));
+        }
+        
+        // Print the 3 lines of this row
+        for (int line = 0; line < 3; line++) {
+            if (line == 1) {
+                // Middle line: show row number
+                std::cout << std::setw(2) << i << " │";
+            } else {
+                // Top and bottom lines: just spacing
+                std::cout << "   │";
+            }
+            
+            // Print this line for all cells in the row with vertical separators
+            for (const auto& cell : row_cells) {
+                std::cout << cell[line] << "│";
+            }
+            std::cout << "\n";
+        }
+        
+        // Print horizontal separator after each row
+        if (i == obs_size - 1) {
+            // Bottom border
+            std::cout << "   └";
+            for (int j = 0; j < obs_size; j++) {
+                std::cout << "───" << (j == obs_size - 1 ? "┘" : "┴");
+            }
+        } else {
+            // Middle separator
+            std::cout << "   ├";
+            for (int j = 0; j < obs_size; j++) {
+                std::cout << "───" << (j == obs_size - 1 ? "┤" : "┼");
+            }
+        }
+        std::cout << "\n";
+    }
+    
+    std::cout << "\nAgent position in observation: (" << obs_radius << "," << obs_radius << ") [center]\n";
+    
+    // Debug decoding for agent position
+    std::cout << "\nDEBUG - Agent decoding verification:\n";
+    int agent_obs_val = obs[5][5]; // Agent at center
+    std::cout << "Agent raw value: " << agent_obs_val << "\n";
+    if (agent_obs_val >= 17) {
+        int agent_info = agent_obs_val - 16;
+        int next_action = agent_info % 16;
+        int flags = (next_action - 1) & 0xF;
+        std::cout << "next_action: " << next_action << ", flags: " << flags << " (binary: ";
+        for (int bit = 3; bit >= 0; bit--) {
+            std::cout << ((flags >> bit) & 1);
+        }
+        std::cout << ")\n";
+        std::cout << "up=" << (flags & 1) << ", down=" << (flags & 2) << ", left=" << (flags & 4) << ", right=" << (flags & 8) << "\n";
+    }
+}
 
 int main()
 {
-    std::vector<std::vector<int>> grid = std::vector<std::vector<int>>(256, std::vector<int>(256, 0));
+    // Create a smaller grid for testing (20x20)
+    std::vector<std::vector<int>> grid = std::vector<std::vector<int>>(20, std::vector<int>(20, 0));
+    
+    // Add some obstacles for testing
+    grid[5][5] = 1;
+    grid[5][6] = 1;
+    grid[6][5] = 1;
+    grid[10][10] = 1;
+    grid[10][11] = 1;
+    grid[11][10] = 1;
+    grid[11][11] = 1;
+    
     ObservationGenerator obs_gen(grid, 5, 128);
-    obs_gen.create_agents(std::vector<std::pair<int, int>>{{120, 120}}, std::vector<std::pair<int, int>>{{20, 200}});
-    obs_gen.update_agents(std::vector<std::pair<int, int>>{{120, 120}}, std::vector<std::pair<int, int>>{{20, 200}}, std::vector<int>{0});
+    
+    // Position agent very close to border to see out-of-bounds areas
+    // Agent at (3,3) with radius 5 will see out-of-bounds on top and left sides
+    // Observation window will be from world coords (-2,-2) to (8,8)
+    std::vector<std::pair<int, int>> agent_positions = {{3, 3}, {12, 8}, {6, 12}};
+    std::vector<std::pair<int, int>> agent_goals = {{15, 15}, {3, 15}, {16, 4}};
+    
+    obs_gen.create_agents(agent_positions, agent_goals);
+    obs_gen.update_agents(agent_positions, agent_goals, std::vector<int>{0, 0, 0});
+    
+    std::pair<int, int> goal = agent_goals[0]; // Use first agent's goal for cost2go display
+    
+    // Display the cost2go matrix with 3x3 directional cells
+    obs_gen.display_cost2go_matrix(goal, false); // use_unicode parameter is now ignored
+    
+    std::cout << "\n" << std::string(80, '=') << "\n";
+    std::cout << "OBSERVATION MATRIX VISUALIZATION:\n";
+    std::cout << std::string(80, '=') << "\n";
+    
+    // Display the observation matrix for the agent
+    obs_gen.display_observation(0);
+    
+    std::cout << "\n" << std::string(60, '-') << "\n";
+    std::cout << "Raw observation values as 11x11 matrix:\n";
     auto obs = obs_gen.generate_observations();
-    for (const auto &obs_row : obs)
-    {
-        for (const auto &cell : obs_row)
-            std::cout << cell << " ";
-        std::cout << std::endl;
+    
+    // Display as matrix matching the observation layout
+    int obs_size = 2 * obs_gen.obs_radius + 1; // Should be 11
+    std::cout << "     ";
+    for (int j = 0; j < obs_size; j++) {
+        std::cout << std::setw(3) << j;
     }
+    std::cout << "\n";
+    
+    for (int i = 0; i < obs_size; i++) {
+        std::cout << std::setw(2) << i << ": ";
+        for (int j = 0; j < obs_size; j++) {
+            int idx = i * obs_size + j;
+            std::cout << std::setw(3) << obs[0][idx];
+        }
+        std::cout << "\n";
+    }
+    
     return 0;
 }
 
