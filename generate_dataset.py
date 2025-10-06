@@ -2,6 +2,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import os
 import numpy as np
+from cppimport import import_hook
 from gpt.observation_generator import ObservationGenerator
 from pogema import GridConfig
 import argparse
@@ -34,8 +35,16 @@ def filter_and_balance_observations(observations, actions):
     non_wait_indices = all_indices[non_wait_mask]
     wait_indices_to_keep = wait_indices[:target_wait_count] if len(wait_indices) > target_wait_count else wait_indices
     all_indices_to_keep = np.concatenate([non_wait_indices, wait_indices_to_keep])
-    final_observations = [observations[i] for i in all_indices_to_keep]
-    final_actions = actions_array[all_indices_to_keep].tolist()
+    filtered_observations = [observations[i] for i in all_indices_to_keep]
+    filtered_actions = actions_array[all_indices_to_keep].tolist()
+    final_observations = []
+    final_actions = []
+    check_obs = set()
+    for i, obs in enumerate(filtered_observations):
+        if tuple(obs) not in check_obs:
+            check_obs.add(tuple(obs))
+            final_observations.append(obs)
+            final_actions.append(filtered_actions[i])
 
     return final_observations, final_actions
 
@@ -50,7 +59,7 @@ def get_data_from_file(file_path):
     return gt_actions, grid, starts, targets, seeds
 
 def generate_observations(gt_actions, grid, starts, targets, seeds):
-    observation_generator = ObservationGenerator(grid, 3, 128)
+    observation_generator = ObservationGenerator(grid, 3, 64)
     observation_generator.create_agents(starts, targets)
     observation_generator.update_agents(starts, targets, [-1 for _ in range(len(starts))])
     observations = []
@@ -72,7 +81,7 @@ def run_worker(files, log_path, dataset_path, samples_per_file, worker_id):
         file_path = os.path.join(log_path, file)
         gt_actions, grid, starts, targets, seeds = get_data_from_file(file_path)
         for i in range(len(gt_actions)):
-            observations, actions = generate_observations(gt_actions[0], grid[0], starts[0], targets[0], seeds[0])
+            observations, actions = generate_observations(gt_actions[i], grid[i], starts[i], targets[i], seeds[i])
             filtered_observations, filtered_actions = filter_and_balance_observations(observations, actions)
             all_observations.extend(filtered_observations)
             all_actions.extend(filtered_actions)
@@ -85,7 +94,7 @@ def run_worker(files, log_path, dataset_path, samples_per_file, worker_id):
 
 def __main__():
     parser = argparse.ArgumentParser(description='Generate dataset')
-    parser.add_argument('--log_path', type=str, default='dataset_mapf/mazes/num_agents_32', help='Path to the logs')
+    parser.add_argument('--log_path', type=str, default='logs_mapf/mazes/num_agents_32', help='Path to the logs')
     parser.add_argument('--dataset_path', type=str, default='dataset_mapf/mazes', help='Path to the dataset')
     parser.add_argument('--samples_per_file', type=int, default=10000, help='Number of samples per file')
     parser.add_argument('--workers', type=int, default=1, help='Number of workers')
