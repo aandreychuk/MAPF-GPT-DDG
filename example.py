@@ -9,7 +9,8 @@ from pogema_toolbox.registry import ToolboxRegistry
 
 from create_env import create_eval_env
 from gpt.inference import MAPFGPTInference, MAPFGPTInferenceConfig
-
+from lacam.inference import LacamInference, LacamInferenceConfig
+from lacam0.inference import LaCAM0Inference, LaCAM0InferenceConfig
 
 def main():
     parser = argparse.ArgumentParser(description='MAPF-GPT Inference Script')
@@ -59,7 +60,9 @@ def main():
     torch.backends.cudnn.deterministic = True
 
     env = create_eval_env(env_cfg)
-    algo = MAPFGPTInference(MAPFGPTInferenceConfig(path_to_weights=f'hf_weights/model-{args.model}.pt', device=args.device))
+    #algo = MAPFGPTInference(MAPFGPTInferenceConfig(path_to_weights=f'weights/MAPF-GPT-2M-D_100k.pt', device=args.device))
+    #algo = LacamInference(LacamInferenceConfig(time_limit=10, timeouts=[10]))
+    algo = LaCAM0Inference(LaCAM0InferenceConfig(time_limit=30))
     algo.reset_states()
     results = run_episode(env, algo)
 
