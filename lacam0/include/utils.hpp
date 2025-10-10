@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <vector>
 
+using uint = unsigned int;
+
 using Time = std::chrono::steady_clock;
 
 // time manager

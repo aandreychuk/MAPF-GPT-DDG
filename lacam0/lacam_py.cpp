@@ -1,8 +1,10 @@
 // cppimport
 /*
 <%
+import sys
+import pybind11
 setup_pybind11(cfg)
-cfg['include_dirs'] = ['include']
+cfg['include_dirs'] = ['include', pybind11.get_include()]
 cfg['sources'] = [
     'src/dist_table.cpp',
     'src/graph.cpp',
@@ -14,9 +16,17 @@ cfg['sources'] = [
     'src/post_processing.cpp',
     'src/utils.cpp',
 ]
-cfg['compiler_args'] = ['-std=c++17', '-O3', '-fPIC', '-m64']
-cfg['extra_link_args'] = ['-m64']
-cfg['linker_args'] = ['-pthread']
+
+if sys.platform == 'darwin':
+    # macOS/Clang: no -m64/-pthread; ensure libc++
+    cfg['compiler_args'] = ['-std=c++17', '-O3', '-fPIC', '-stdlib=libc++']
+    cfg['extra_link_args'] = ['-stdlib=libc++']
+    cfg['linker_args'] = []
+else:
+    # Linux defaults
+    cfg['compiler_args'] = ['-std=c++17', '-O3', '-fPIC', '-m64']
+    cfg['extra_link_args'] = ['-m64', '-pthread']
+    cfg['linker_args'] = []
 %>
 */
 #include <pybind11/pybind11.h>
