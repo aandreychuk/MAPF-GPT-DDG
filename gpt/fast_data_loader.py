@@ -10,6 +10,9 @@ from loguru import logger
 from torch.utils.data import Dataset
 
 
+ACTION_HORIZON = 3
+
+
 class MapfArrowDataset(torch.utils.data.Dataset):
     def __init__(self, folder_path, device, batch_size):
         self.all_data_files = self.file_paths = sorted(glob.glob(os.path.join(folder_path, "*.arrow")))
@@ -31,7 +34,12 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         sample_input_tensors, sample_gt_actions = self._get_data_from_file(self.file_paths[0])
 
         self.input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
-        self.target_tensors = torch.full(sample_input_tensors.shape, -1, dtype=self.dtype, device=self.device)
+        self.target_tensors = torch.full(
+            sample_input_tensors.shape + (ACTION_HORIZON,),
+            -1,
+            dtype=self.dtype,
+            device=self.device,
+        )
 
         logger.info(
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
@@ -56,7 +64,14 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         input_tensors, gt_actions = self._get_data_from_file(filename)
 
         self.input_tensors.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
-        self.target_tensors[:, -1].copy_(torch.tensor(gt_actions, dtype=self.dtype), non_blocking=True)
+        gt_actions_tensor = torch.tensor(gt_actions, dtype=self.dtype)
+        if gt_actions_tensor.ndim == 1:
+            gt_actions_tensor = gt_actions_tensor.unsqueeze(-1)
+        if gt_actions_tensor.size(-1) != ACTION_HORIZON:
+            raise ValueError(
+                f"Expected gt_actions last dimension to be {ACTION_HORIZON}, got {gt_actions_tensor.size(-1)}"
+            )
+        self.target_tensors[:, -1, :].copy_(gt_actions_tensor, non_blocking=True)
         finish_time = time.monotonic() - start_time
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
 

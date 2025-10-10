@@ -14,6 +14,7 @@
 #include <sstream>
 #include <fstream>
 #include <iomanip>
+#define PYBIND11_MODULE
 #ifdef PYBIND11_MODULE
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>

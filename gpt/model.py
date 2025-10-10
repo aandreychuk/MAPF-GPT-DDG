@@ -1,6 +1,7 @@
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -113,6 +114,8 @@ class GPTConfig:
     n_embd: int = 256
     dropout: float = 0.0
     bias: bool = False
+    action_horizon: int = 3
+    action_vocab_size: int = 5
 
 
 class GPT(nn.Module):
@@ -122,6 +125,8 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        self.action_horizon = config.action_horizon
+        self.action_vocab_size = config.action_vocab_size
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -130,12 +135,14 @@ class GPT(nn.Module):
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.policy_heads = nn.ModuleList([
+            nn.Linear(config.n_embd, config.action_vocab_size, bias=config.bias)
+            for _ in range(self.action_horizon)
+        ])
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -164,7 +171,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets: Optional[torch.Tensor] = None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -177,13 +184,23 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
+        logits = torch.stack([head(x) for head in self.policy_heads], dim=-2)
+
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            losses = []
+            for slot_idx in range(self.action_horizon):
+                slot_logits = logits[:, :, slot_idx, :]
+                slot_targets = targets[..., slot_idx]
+                losses.append(
+                    F.cross_entropy(
+                        slot_logits.reshape(-1, slot_logits.size(-1)),
+                        slot_targets.reshape(-1),
+                        ignore_index=-1,
+                    )
+                )
+            loss = torch.stack(losses).mean()
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            logits = logits[:, [-1], :, :]
             loss = None
 
         return logits, loss
@@ -244,14 +261,10 @@ class GPT(nn.Module):
     @torch.no_grad()
     def act(self, idx, do_sample=True, generator=None):
         logits, _ = self(idx)
-        logits = logits[:, -1, :]
+        logits = logits[:, 0, 0, :]
+        logits = logits[:, :self.action_vocab_size]
 
-        # Mask logits to consider only the first 5 indexes
-        mask = torch.ones_like(logits) * float('-inf')
-        mask[:, :5] = logits[:, :5]
-        masked_logits = mask
-
-        probs = F.softmax(masked_logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)
 
         if do_sample:
             idx_next = torch.multinomial(probs, num_samples=1, generator=generator)

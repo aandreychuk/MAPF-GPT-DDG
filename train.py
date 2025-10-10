@@ -219,12 +219,16 @@ model_args = dict(
     bias=bias,
     vocab_size=None,
     dropout=dropout,
-)  # start with model_args from command line
+    action_horizon=3,
+    action_vocab_size=5,
+)
 start_iter_num = 0
 if init_from == "scratch":
     # init a new model from scratch
     logger.info("Initializing a new model from scratch")
     model_args["vocab_size"] = meta_vocab_size
+    model_args.setdefault("action_horizon", 3)
+    model_args.setdefault("action_vocab_size", 5)
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == "resume":
