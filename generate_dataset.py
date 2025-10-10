@@ -1,3 +1,4 @@
+import math
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import os
@@ -11,11 +12,11 @@ from multiprocessing import Pool
 def save_to_arrow(inputs, gt_actions, filepath):
     schema = pa.schema([
         ('input_tensors', pa.list_(pa.int8())),
-        ('gt_actions', pa.int8())
+        ('gt_actions', pa.list_(pa.int8()))
     ])
 
     input_tensors_col = pa.array(inputs, type=pa.list_(pa.int8()))
-    gt_actions_col = pa.array(gt_actions, type=pa.int8())
+    gt_actions_col = pa.array(gt_actions, type=pa.list_(pa.int8()))
     table = pa.Table.from_arrays([input_tensors_col, gt_actions_col], schema=schema)
 
     if not os.path.exists(os.path.dirname(filepath)):
@@ -25,18 +26,39 @@ def save_to_arrow(inputs, gt_actions, filepath):
             writer.write(table)
 
 def filter_and_balance_observations(observations, actions):
-    actions_array = np.array(actions)
-    wait_mask = actions_array == 0
-    non_wait_mask = actions_array != 0
-    num_non_wait = np.sum(non_wait_mask)
-    target_wait_count = num_non_wait // 4
-    all_indices = np.arange(len(actions))
-    wait_indices = all_indices[wait_mask]
-    non_wait_indices = all_indices[non_wait_mask]
-    wait_indices_to_keep = wait_indices[:target_wait_count] if len(wait_indices) > target_wait_count else wait_indices
-    all_indices_to_keep = np.concatenate([non_wait_indices, wait_indices_to_keep])
-    filtered_observations = [observations[i] for i in all_indices_to_keep]
-    filtered_actions = actions_array[all_indices_to_keep].tolist()
+    actions_array = np.array(actions, dtype=np.int8)
+    if actions_array.ndim == 1:
+        actions_array = actions_array[:, None]
+
+    horizon = actions_array.shape[1]
+    total_actions = len(actions_array) * horizon
+    zero_mask = actions_array == 0
+    total_zero_actions = int(zero_mask.sum())
+
+    zero_tuple_mask = np.all(zero_mask, axis=1)
+    zero_tuple_indices = np.where(zero_tuple_mask)[0]
+    zero_tuple_count = int(zero_tuple_indices.size)
+
+    total_tuples = len(actions_array)
+    target_ratio = 0.2
+
+    if zero_tuple_count == 0 or total_zero_actions <= target_ratio * total_actions:
+        filtered_indices = np.arange(total_tuples)
+        filtered_observations = [observations[i] for i in filtered_indices]
+        filtered_actions = actions_array[filtered_indices].tolist()
+    else:
+        numerator = total_zero_actions - target_ratio * total_actions
+        remove_tuple_count = math.ceil(numerator / ((1 - target_ratio) * horizon))
+        remove_tuple_count = min(max(remove_tuple_count, 0), zero_tuple_count)
+
+        keep_mask = np.ones(total_tuples, dtype=bool)
+        if remove_tuple_count > 0:
+            remove_indices = zero_tuple_indices[:remove_tuple_count]
+            keep_mask[remove_indices] = False
+
+        filtered_indices = np.where(keep_mask)[0]
+        filtered_observations = [observations[i] for i in filtered_indices]
+        filtered_actions = actions_array[filtered_indices].tolist()
     final_observations = []
     final_actions = []
     check_obs = set()
@@ -68,7 +90,7 @@ def generate_observations(gt_actions, grid, starts, targets, seeds):
     moves = GridConfig().MOVES
     for i in range(len(gt_actions)):
         observations.extend(observation_generator.generate_observations())
-        actions.extend(gt_actions[i])
+        actions.extend((gt_actions[i], gt_actions[i+1] if i+1 < len(gt_actions) else 0, gt_actions[i+2] if i+2 < len(gt_actions) else 0))
         positions = [[positions[j][0] + moves[gt_actions[i][j]][0], positions[j][1] + moves[gt_actions[i][j]][1]] for j in range(len(positions))]
         observation_generator.update_agents(positions, targets, gt_actions[i])
     return observations, actions
