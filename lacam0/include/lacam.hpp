@@ -21,6 +21,9 @@
 #include "instance.hpp"
 #include "pibt.hpp"
 #include "utils.hpp"
+#include <unordered_map>
+#include <queue>
+#include <vector>
 
 // low-level search node
 struct LNode {
@@ -74,6 +77,22 @@ struct LaCAM {
   HNode *H_goal;
   std::deque<HNode *> OPEN;
   int loop_cnt;
+  
+  // Priority queue for f-value based expansion (used in solve_from_config)
+  struct HNodeComparator {
+    bool operator()(const HNode* a, const HNode* b) const {
+      if (a->f != b->f) return a->f > b->f;  // Lower f-value first
+      return a->h > b->h;  // Tie-break with lower h-value
+    }
+  };
+  std::priority_queue<HNode*, std::vector<HNode*>, HNodeComparator> OPEN_PQ;
+
+  // persistent cache (optional)
+  bool reuse_cache = false;  // if true, EXPLORED/GC_HNodes persist across solves
+  std::unordered_map<Config, HNode *, ConfigHasher> EXPLORED_CACHE;
+  HNodes GC_HNodes_CACHE;
+  const Instance *cache_ins = nullptr;  // to validate cache compatibility
+  DistTable *cache_D = nullptr;
 
   // Hyperparameters
   static bool ANYTIME;
@@ -84,11 +103,21 @@ struct LaCAM {
         const Deadline *_deadline = nullptr, int _seed = 0);
   ~LaCAM();
   Solution solve();
+  // Start search from an arbitrary configuration while keeping the same goals
+  Solution solve_from_config(const Config &start);
+  // Control cache reuse lifecycle
+  void set_reuse_cache(bool enable) { reuse_cache = enable; }
+  void clear_cache();
   bool set_new_config(HNode *S, LNode *M, Config &Q_to);
   void rewrite(HNode *H_from, HNode *H_to);
   int get_g_val(HNode *H_parent, const Config &Q_to);
   int get_h_val(const Config &Q);
   int get_edge_cost(const Config &Q1, const Config &Q2);
+  
+  // Cache merging utilities
+  void merge_cached_subtree(HNode *H_new, HNode *H_cached, 
+                           std::unordered_map<Config, HNode *, ConfigHasher> &EXPLORED,
+                           HNodes &GC_HNodes);
 
   // utilities
   template <typename... Body>
