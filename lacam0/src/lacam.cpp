@@ -1,6 +1,7 @@
 #include "../include/lacam.hpp"
 #include <queue>
 #include <unordered_set>
+#include <chrono>
 
 bool LaCAM::ANYTIME = false;
 float LaCAM::RANDOM_INSERT_PROB1 = 0.001;
@@ -107,44 +108,63 @@ LaCAM::LaCAM(const Instance *_ins, DistTable *_D, int _verbose,
 
 LaCAM::~LaCAM() {}
 
-Solution LaCAM::solve()
+Solution LaCAM::solve(const Config *custom_start, float deadline_seconds)
 {
   solver_info(1, "LaCAM begins");
+  // Fresh counters/state per run
+  reset_counters();
+  H_goal = nullptr;
+  stats_generated = 0;
+  stats_merged = 0;
+  ++current_run_version;
+  const bool use_solution_cache = !BEST_SUCCESSOR_CACHE.empty();
+  const bool accumulate_solution_cache = !use_solution_cache; // only the first run accumulates
+  
+  // Use custom start if provided, otherwise use instance start
+  const Config &start_config = (custom_start != nullptr) ? *custom_start : ins->starts;
+  
+  // Enable anytime mode if deadline is provided and > 0
+  if (deadline_seconds > 0.0f) {
+    ANYTIME = true;
+  } else {
+    ANYTIME = false;
+  }
 
   // setup search
   auto EXPLORED = std::unordered_map<Config, HNode *, ConfigHasher>();
   HNodes GC_HNodes;
+  // Track which cached configurations have been merged to avoid duplicate merging in this run
+  std::unordered_set<Config, ConfigHasher> merged_from_cache_configs;
 
   // seed from cache if enabled and compatible
   const bool can_reuse = reuse_cache && cache_ins == ins && cache_D == D;
-  if (can_reuse) {
-    EXPLORED = EXPLORED_CACHE;
-    GC_HNodes = GC_HNodes_CACHE;
-  } else {
+  if (!can_reuse && reuse_cache) {
     // reset cache context if reuse requested but incompatible
-    if (reuse_cache) {
-      EXPLORED_CACHE.clear();
-      GC_HNodes_CACHE.clear();
-    }
-    cache_ins = ins;
-    cache_D = D;
+    EXPLORED_CACHE.clear();
+    GC_HNodes_CACHE.clear();
   }
+  cache_ins = ins;
+  cache_D = D;
 
   // insert initial node
   HNode *H_init = nullptr;
-  auto it_cached = EXPLORED.find(ins->starts);
+  auto it_cached = EXPLORED.find(start_config);
   if (it_cached != EXPLORED.end()) {
     H_init = it_cached->second;
   } else {
-    H_init = new HNode(ins->starts, D, ins);
+    H_init = new HNode(start_config, D, ins);
     EXPLORED[H_init->Q] = H_init;
     GC_HNodes.push_back(H_init);
   }
+  OPEN.clear();
   OPEN.push_front(H_init);
 
   // search loop
   solver_info(2, "search iteration begins");
-  while (!OPEN.empty() && !is_expired(deadline)) {
+  // Use deadline if provided, otherwise use instance deadline
+  auto start_time = std::chrono::high_resolution_clock::now();
+  while (!OPEN.empty() && (deadline_seconds <= 0.0f || 
+         std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - start_time).count() < deadline_seconds)) {
     ++loop_cnt;
 
     // random insert
@@ -160,7 +180,7 @@ Solution LaCAM::solve()
 
     // do not pop here!
     auto H = OPEN.front();  // high-level node
-    std::cout << "H->Q: " << H->Q << std::endl;
+    //std::cout << "H->Q: " << H->Q << std::endl;
     // check uppwer bounds
     if (H_goal != nullptr && H->g >= H_goal->g) {
       OPEN.pop_front();
@@ -173,13 +193,16 @@ Solution LaCAM::solve()
     if (H_goal == nullptr && is_same_config(H->Q, ins->goals)) {
       H_goal = H;
       solver_info(2, "found solution, g=", H->g, ", depth=", H->depth);
+      // Immediately cache this solution path (suffix graph and best tracking) only on first run
+      if (accumulate_solution_cache) cache_solution_suffix_from_goal(H_goal);
       if (!ANYTIME) break;
+      // In anytime mode, continue searching for better solutions (don't break)
       continue;
     }
 
     // extract constraints
     if (H->search_tree.empty()) {
-      OPEN.pop_front();
+      // With priority queue OPEN_PQ, just skip if no low-level expansions
       continue;
     }
     auto L = H->search_tree.front();
@@ -199,6 +222,48 @@ Solution LaCAM::solve()
     delete L;
     if (!res) continue;
 
+    // check if we reached a cached solution suffix
+    if (use_solution_cache && BEST_SUCCESSOR_CACHE.find(Q_to) != BEST_SUCCESSOR_CACHE.end()) {
+      // If Q_to is on the best known solution, we can splice and return immediately
+      if (BEST_SOLUTION_SET.find(Q_to) != BEST_SOLUTION_SET.end() && best_solution_version < current_run_version) {
+        // Debug: report splice details and estimated costs
+        int prefix_g = H->g;
+        int remaining_g = -1;
+        auto rem_it = REMAINING_G_CACHE.find(H->Q);
+        if (rem_it != REMAINING_G_CACHE.end()) remaining_g = rem_it->second;
+        solver_info(2, "splice from cached best: prefix_g=", prefix_g,
+                    ", remaining_g=", remaining_g,
+                    ", total=", (remaining_g >= 0 ? prefix_g + remaining_g : -1),
+                    ", run_ver=", current_run_version,
+                    ", best_ver=", best_solution_version);
+        Solution spliced;
+        build_spliced_solution_from_cached(H, spliced);
+        solver_info(2, "spliced solution length=", (int)spliced.size());
+        return spliced;
+      }
+      // Otherwise, merge nodes from solution tree into current OPEN to avoid regeneration
+      // Push known successors of Q_to in prioritized order
+      if (best_solution_version < current_run_version) {
+        auto &succs = SOL_TREE_SUCCESSORS[Q_to];
+        if (!succs.empty()) {
+        std::vector<HNode*> to_push;
+        to_push.reserve(succs.size());
+        for (auto &Q_succ : succs) {
+          // Create a fresh node tied to current parent H
+          auto H_new = new HNode(Q_succ, D, ins, H, get_g_val(H, Q_succ), get_h_val(Q_succ));
+          EXPLORED[H_new->Q] = H_new;
+          GC_HNodes.push_back(H_new);
+          to_push.push_back(H_new);
+          ++stats_merged;
+        }
+        if (!to_push.empty()) {
+          solver_info(3, "inject successors from solution tree: ", (int)to_push.size());
+          push_prioritized(to_push);
+        }
+        }
+      }
+    }
+
     // check explored list
     auto iter = EXPLORED.find(Q_to);
     if (iter == EXPLORED.end()) {
@@ -207,6 +272,21 @@ Solution LaCAM::solve()
       OPEN.push_front(H_new);
       EXPLORED[H_new->Q] = H_new;
       GC_HNodes.push_back(H_new);
+      ++stats_generated;
+
+      // If this configuration exists in cache, merge its subtree with explicit recomputation
+      if (can_reuse) {
+        auto cache_iter = EXPLORED_CACHE.find(Q_to);
+        if (cache_iter != EXPLORED_CACHE.end()) {
+          // Avoid redundant merges of the same root config
+          if (merged_from_cache_configs.find(Q_to) == merged_from_cache_configs.end()) {
+            auto H_cached = cache_iter->second;
+            merge_cached_subtree(H_new, H_cached, EXPLORED, GC_HNodes, merged_from_cache_configs);
+            merged_from_cache_configs.insert(Q_to);
+            //solver_info(3, "merged cached configuration and subtree");
+          }
+        }
+      }
     } else {
       // known configuration
       auto H_known = iter->second;
@@ -231,6 +311,10 @@ Solution LaCAM::solve()
     }
     std::reverse(solution.begin(), solution.end());
   }
+  // Cache solution suffix graph if a goal was found
+  if (!solution.empty()) {
+    cache_solution_suffix_from_goal(H_goal);
+  }
 
   // solution
   if (solution.empty()) {
@@ -251,177 +335,83 @@ Solution LaCAM::solve()
 
   // end processing
   if (reuse_cache) {
-    // persist cache for next runs
-    EXPLORED_CACHE = EXPLORED;
-    GC_HNodes_CACHE = GC_HNodes;
+    // persist cache for next runs, but only if configs don't already exist
+    for (auto &pair : EXPLORED) {
+      if (EXPLORED_CACHE.find(pair.first) == EXPLORED_CACHE.end()) {
+        EXPLORED_CACHE[pair.first] = pair.second;
+      }
+    }
+    for (auto H : GC_HNodes) {
+      // Only add to cache if this config wasn't already cached
+      if (EXPLORED_CACHE.find(H->Q) == EXPLORED_CACHE.end()) {
+        GC_HNodes_CACHE.push_back(H);
+      }
+    }
   } else {
     for (auto &&H : GC_HNodes) delete H;  // memory management
   }
 
+  // Print run-level statistics
+  solver_info(2, "stats: generated=", stats_generated, ", merged=", stats_merged);
+
   return solution;
 }
 
-Solution LaCAM::solve_from_config(const Config &start)
+void LaCAM::cache_solution_suffix_from_goal(HNode *goal)
 {
-  solver_info(1, "LaCAM begins (from config)");
-
-  // Always start fresh search tree for new start configuration
-  auto EXPLORED = std::unordered_map<Config, HNode *, ConfigHasher>();
-  HNodes GC_HNodes;
-  
-  // Track which cached configurations have been merged to avoid duplicate merging
-  std::unordered_set<Config, ConfigHasher> merged_from_cache;
-
-  // Check if we can reuse cache
-  const bool can_reuse = reuse_cache && cache_ins == ins && cache_D == D;
-  if (!can_reuse && reuse_cache) {
-    EXPLORED_CACHE.clear();
-    GC_HNodes_CACHE.clear();
-    cache_ins = ins;
-    cache_D = D;
+  // Build suffix pointers from each config on the path to its next config
+  std::vector<HNode*> path;
+  auto H = goal;
+  while (H != nullptr) {
+    path.push_back(H);
+    H = H->parent;
   }
-
-  // Always create fresh start node for new search tree
-  auto H_init = new HNode(start, D, ins);
-  EXPLORED[H_init->Q] = H_init;
-  GC_HNodes.push_back(H_init);
-  
-  // Use priority queue for f-value based expansion
-  OPEN_PQ = std::priority_queue<HNode*, std::vector<HNode*>, HNodeComparator>();
-  OPEN_PQ.push(H_init);
-  H_goal = nullptr;
-
-  // search loop with f-value based expansion
-  solver_info(2, "search iteration begins (f-value based)");
-  while (!OPEN_PQ.empty() && !is_expired(deadline)) {
-    ++loop_cnt;
-
-    // Random insertions for diversification (less frequent with f-value ordering)
-    if (H_goal != nullptr) {
-      auto r = rrd(MT);
-      if (r < RANDOM_INSERT_PROB2 / 4) {  // Reduced probability
-        OPEN_PQ.push(H_init);
-      } else if (r < RANDOM_INSERT_PROB2 / 2) {  // Reduced probability
-        // For priority queue, we can't easily get random element, so skip this case
-        // or implement a more complex random selection
-      }
-    }
-
-    // Select node with lowest f-value (and lowest h-value for ties)
-    auto H = OPEN_PQ.top();
-    OPEN_PQ.pop();
-    std::cout << "H->Q: " << H->Q << " f=" << H->f << " h=" << H->h << " g=" << H->g << std::endl;
-
-    // Pruning based on f-values
-    if (H_goal != nullptr && H->f >= H_goal->f) {
-      solver_info(5, "prune, f=", H->f, " >= ", H_goal->f);
-      continue;
-    }
-
-    if (H_goal == nullptr && is_same_config(H->Q, ins->goals)) {
-      H_goal = H;
-      solver_info(2, "found solution, g=", H->g, ", depth=", H->depth);
-      if (!ANYTIME) break;
-      continue;
-    }
-
-    if (H->search_tree.empty()) {
-      OPEN.pop_front();
-      continue;
-    }
-    auto L = H->search_tree.front();
-    H->search_tree.pop();
-
-    if (L->depth < H->Q.size()) {
-      const auto i = H->order[L->depth];
-      auto &&C = H->Q[i]->actions;
-      std::shuffle(C.begin(), C.end(), MT);
-      for (auto u : C) H->search_tree.push(new LNode(L, i, u));
-    }
-
-    auto Q_to = Config(ins->N, nullptr);
-    auto res = set_new_config(H, L, Q_to);
-    delete L;
-    if (!res) continue;
-
-    auto iter = EXPLORED.find(Q_to);
-    if (iter == EXPLORED.end()) {
-      // Check if this configuration exists in cache
-      HNode *H_cached = nullptr;
-      if (can_reuse) {
-        auto cache_iter = EXPLORED_CACHE.find(Q_to);
-        if (cache_iter != EXPLORED_CACHE.end()) {
-          H_cached = cache_iter->second;
-          std::cout << "H_cached->Q: " << H_cached->Q << " FOUND IN CACHE" << std::endl;
-        }
-      }
-      
-      if (H_cached != nullptr) {
-        // Check if this cached configuration was already merged
-        if (merged_from_cache.find(Q_to) == merged_from_cache.end()) {
-          // Merge cached node into new search tree
-          auto H_new = new HNode(Q_to, D, ins, H, get_g_val(H, Q_to), get_h_val(Q_to));
-          OPEN_PQ.push(H_new);
-          EXPLORED[H_new->Q] = H_new;
-          GC_HNodes.push_back(H_new);
-          
-          // Mark as merged and merge entire cached subtree
-          merged_from_cache.insert(Q_to);
-          merge_cached_subtree(H_new, H_cached, EXPLORED, GC_HNodes);
-          
-          solver_info(3, "merged cached configuration and subtree");
-        } else {
-          // Configuration already merged, just create a regular new node
-          auto H_new = new HNode(Q_to, D, ins, H, get_g_val(H, Q_to), get_h_val(Q_to));
-          OPEN_PQ.push(H_new);
-          EXPLORED[H_new->Q] = H_new;
-          GC_HNodes.push_back(H_new);
-          
-          solver_info(3, "cached configuration already merged, created regular node");
-        }
-      } else {
-        // Completely new configuration
-        auto H_new = new HNode(Q_to, D, ins, H, get_g_val(H, Q_to), get_h_val(Q_to));
-        OPEN_PQ.push(H_new);
-        EXPLORED[H_new->Q] = H_new;
-        GC_HNodes.push_back(H_new);
-      }
-    } else {
-      auto H_known = iter->second;
-      rewrite(H, H_known);
-
-      if (rrd(MT) >= RANDOM_INSERT_PROB1) {
-        OPEN_PQ.push(iter->second);
-      } else {
-        solver_info(3, "random restart");
-        OPEN_PQ.push(H_init);
-      }
+  std::reverse(path.begin(), path.end());
+  // Compute remaining g from each node to goal
+  int remaining = 0;
+  for (int i = (int)path.size() - 1; i >= 0; --i) {
+    REMAINING_G_CACHE[path[i]->Q] = remaining;
+    if (i > 0) {
+      // edge cost equals sum of agent deltas defined by get_edge_cost
+      remaining += get_edge_cost(path[i-1]->Q, path[i]->Q);
     }
   }
-
-  Solution solution;
-  {
-    auto H = H_goal;
-    while (H != nullptr) {
-      solution.push_back(H->Q);
-      H = H->parent;
-    }
-    std::reverse(solution.begin(), solution.end());
+  for (size_t i = 0; i + 1 < path.size(); ++i) {
+    BEST_SUCCESSOR_CACHE[path[i]->Q] = path[i+1]->Q;
+    SOL_TREE_SUCCESSORS[path[i]->Q].push_back(path[i+1]->Q);
   }
-
-  if (reuse_cache) {
-    // Merge new search tree into cache
-    for (auto &pair : EXPLORED) {
-      EXPLORED_CACHE[pair.first] = pair.second;
-    }
-    for (auto H : GC_HNodes) {
-      GC_HNodes_CACHE.push_back(H);
-    }
-  } else {
-    for (auto &&H : GC_HNodes) delete H;
+  // update best solution record
+  int g_total = path.back()->g;
+  if (g_total < BEST_SOLUTION_G) {
+    BEST_SOLUTION_G = g_total;
+    BEST_SOLUTION_SET.clear();
+    for (auto *node : path) BEST_SOLUTION_SET.insert(node->Q);
+    best_solution_version = current_run_version;
   }
+}
 
-  return solution;
+void LaCAM::build_spliced_solution_from_cached(HNode *prefix_end,
+                                               Solution &out_solution)
+{
+  // Build prefix
+  std::vector<Config> prefix;
+  auto H = prefix_end;
+  while (H != nullptr) {
+    prefix.push_back(H->Q);
+    H = H->parent;
+  }
+  std::reverse(prefix.begin(), prefix.end());
+  // Append cached suffix if exists starting from last prefix config
+  if (!prefix.empty()) {
+    auto cur = prefix.back();
+    while (BEST_SUCCESSOR_CACHE.find(cur) != BEST_SUCCESSOR_CACHE.end()) {
+      cur = BEST_SUCCESSOR_CACHE[cur];
+      prefix.push_back(cur);
+      // Stop if we loop defensively (shouldn't happen if cache is a tree)
+      if (prefix.size() > 1000000) break;
+    }
+  }
+  out_solution = std::move(prefix);
 }
 
 void LaCAM::clear_cache()
@@ -433,29 +423,63 @@ void LaCAM::clear_cache()
   cache_D = nullptr;
 }
 
+void LaCAM::reset_counters()
+{
+  loop_cnt = 0;
+  // Note: deadline is external and not reset here
+  // If you need to reset timing, create a new LaCAM instance or pass a new deadline
+}
+
+// Helper function to push nodes in prioritized order (lower f-value first)
+void LaCAM::push_prioritized(const std::vector<HNode*>& nodes)
+{
+  // Sort nodes by f-value (and h-value for ties)
+  std::vector<HNode*> sorted_nodes = nodes;
+  std::sort(sorted_nodes.begin(), sorted_nodes.end(), [](HNode* a, HNode* b) {
+    if (a->f != b->f) return a->f < b->f;
+    return a->h < b->h;
+  });
+  
+  // Push all nodes to deque (best first)
+  for (auto H : sorted_nodes) {
+    OPEN.push_front(H);
+  }
+}
+
 void LaCAM::merge_cached_subtree(HNode *H_new, HNode *H_cached, 
                                 std::unordered_map<Config, HNode *, ConfigHasher> &EXPLORED,
-                                HNodes &GC_HNodes)
+                                HNodes &GC_HNodes,
+                                std::unordered_set<Config, ConfigHasher> &merged_configs)
 {
-  // Copy neighbor information from cached node
-  for (auto neighbor : H_cached->neighbors) {
-    H_new->neighbors.insert(neighbor);
-  }
+  // Do not attach cached neighbor pointers directly; we'll rebuild nodes explicitly
+  // Track visited cached nodes to avoid processing duplicates
+  std::unordered_set<HNode*> visited_cached;
   
   // Create a mapping from cached nodes to new nodes
   std::unordered_map<HNode*, HNode*> cached_to_new;
   cached_to_new[H_cached] = H_new;
   
+  // Collect all new nodes to push in prioritized order
+  std::vector<HNode*> nodes_to_push;
+  
   // Recursively merge all descendants of the cached node
+  // Only follow true successors (parent-child relationships), not cross-edges from rewrite
   std::queue<HNode*> to_process;
   for (auto neighbor : H_cached->neighbors) {
-    to_process.push(neighbor);
+    if (neighbor->parent == H_cached) {
+      to_process.push(neighbor);
+    }
   }
   
   while (!to_process.empty()) {
     auto H_descendant = to_process.front();
     to_process.pop();
+    if (visited_cached.count(H_descendant)) continue;
+    visited_cached.insert(H_descendant);
     
+    // Mark this configuration as merged to avoid re-merge elsewhere
+    merged_configs.insert(H_descendant->Q);
+
     // Check if this descendant is already in the new search tree
     auto iter = EXPLORED.find(H_descendant->Q);
     if (iter == EXPLORED.end()) {
@@ -471,22 +495,26 @@ void LaCAM::merge_cached_subtree(HNode *H_new, HNode *H_cached,
       // EXPLICITLY calculate depth, g, and f values for the new node
       int new_depth = (parent_in_new != nullptr) ? parent_in_new->depth + 1 : 0;
       int new_h = get_h_val(H_descendant->Q);
-      std::cout<<"new_depth: "<<new_depth<< " "<<H_descendant->Q<<" "<<parent_in_new->Q<<std::endl;
+      /*if (parent_in_new != nullptr) {
+        std::cout<<"new_depth: "<<new_depth<< " "<<H_descendant->Q<<" "<<parent_in_new->Q<<std::endl;
+      } else {
+        std::cout<<"new_depth: "<<new_depth<< " "<<H_descendant->Q<<" [null-parent]"<<std::endl;
+      }*/
       // Create new node first
       auto H_new_desc = new HNode(H_descendant->Q, D, ins, parent_in_new, 0, new_h);
       
-      // EXPLICITLY calculate and set g_values vector
+      // EXPLICITLY calculate and set g_values vector with transition rules
       std::vector<int> new_g_values(ins->N);
       if (parent_in_new != nullptr) {
         // Inherit parent's g_values
         for (size_t i = 0; i < ins->N; ++i) {
           new_g_values[i] = parent_in_new->g_values[i];
         }
-        
-        // Update g_values based on agent goal status
+        // Apply transitions relative to parent_in_new
         for (size_t i = 0; i < ins->N; ++i) {
-          // If agent is not at goal, g-value equals current depth
-          if (H_descendant->Q[i] != ins->goals[i]) {
+          const bool parent_at_goal = (parent_in_new->Q[i] == ins->goals[i]);
+          const bool child_at_goal = (H_descendant->Q[i] == ins->goals[i]);
+          if ((child_at_goal && !parent_at_goal) || (!child_at_goal && parent_at_goal)) {
             new_g_values[i] = new_depth;
           }
         }
@@ -503,28 +531,38 @@ void LaCAM::merge_cached_subtree(HNode *H_new, HNode *H_cached,
         new_g += new_g_values[i];
       }
       int new_f = new_g + new_h;
-      std::cout<<"H_new_desc->Q: "<<H_new_desc->Q<<" "<<new_depth<<" "<<new_g<<" "<<new_h<<" "<<new_f<<std::endl;
+      //std::cout<<"H_new_desc->Q: "<<H_new_desc->Q<<" "<<new_depth<<" "<<new_g<<" "<<new_h<<" "<<new_f<<std::endl;
       // EXPLICITLY override all calculated values
       H_new_desc->depth = new_depth;
       H_new_desc->g_values = new_g_values;
       H_new_desc->g = new_g;
       H_new_desc->f = new_f;
+
+      // Link to parent in new tree
+      H_new_desc->parent = parent_in_new;
       
       EXPLORED[H_new_desc->Q] = H_new_desc;
       GC_HNodes.push_back(H_new_desc);
       cached_to_new[H_descendant] = H_new_desc;
+      ++stats_merged;
       
-      // Add to priority queue for expansion
-      OPEN_PQ.push(H_new_desc);
+      // Collect node for prioritized pushing
+      nodes_to_push.push_back(H_new_desc);
       
-      // Copy neighbor information
+      // Enqueue only true successors (parent-child relationships) to process
       for (auto neighbor : H_descendant->neighbors) {
-        H_new_desc->neighbors.insert(neighbor);
-        to_process.push(neighbor);
+        if (neighbor->parent == H_descendant) {
+          to_process.push(neighbor);
+        }
       }
       
       solver_info(4, "merged cached descendant with recalculated values");
     }
+  }
+  
+  // Push all collected nodes in prioritized order
+  if (!nodes_to_push.empty()) {
+    push_prioritized(nodes_to_push);
   }
 }
 
@@ -574,6 +612,11 @@ void LaCAM::rewrite(HNode *H_from, HNode *H_to)
         }
         
         Q.push(n_to);
+        // If goal improved, refresh cached solution suffix
+        if (n_to == H_goal && best_solution_version < current_run_version) {
+          // Only refresh cached suffix if it belongs to a previous run (never during current run)
+          cache_solution_suffix_from_goal(H_goal);
+        }
         if (H_goal != nullptr && n_to->f < H_goal->f) {
           OPEN.push_front(n_to);
           solver_info(4, "reinsert: g=", n_to->g, " < ", H_goal->g);

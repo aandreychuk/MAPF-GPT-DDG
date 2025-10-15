@@ -117,7 +117,7 @@ class LaCAMWrapper {
   std::vector<std::vector<std::pair<int, int>>> get_solution()
   {
     if (!lacam_) throw std::runtime_error("call init() first");
-    auto solution = lacam_->solve();
+    auto solution = lacam_->solve(nullptr, deadline_ptr_.get()->time_limit_ms/1000.0);
 
     // Convert to trajectories of (x,y)
     // solution: vector<Config>; take per-agent positions over time
@@ -148,7 +148,7 @@ class LaCAMWrapper {
 
   // Start from custom starts while keeping the same goals
   std::vector<std::vector<std::pair<int, int>>> get_solution_from_starts(
-      const std::vector<std::pair<int, int>> &starts_rc)
+      const std::vector<std::pair<int, int>> &starts_rc, float deadline_seconds = -1.0f)
   {
     if (!lacam_) throw std::runtime_error("call init() first");
     const int w = instance_->G.width;
@@ -166,7 +166,7 @@ class LaCAMWrapper {
       starts.push_back(v);
     }
 
-    auto solution = lacam_->solve_from_config(starts);
+    auto solution = lacam_->solve(&starts, deadline_seconds);
 
     const size_t T = solution.size();
     const size_t N = instance_->N;
@@ -211,7 +211,8 @@ PYBIND11_MODULE(lacam_py, m)
       .def("get_solution", &LaCAMWrapper::get_solution)
       .def("set_reuse_cache", &LaCAMWrapper::set_reuse_cache, py::arg("enable"))
       .def("clear_cache", &LaCAMWrapper::clear_cache)
-      .def("get_solution_from_starts", &LaCAMWrapper::get_solution_from_starts, py::arg("starts_xy"));
+      .def("get_solution_from_starts", &LaCAMWrapper::get_solution_from_starts, 
+           py::arg("starts_xy"), py::arg("deadline_seconds") = -1.0f);
 }
 
 

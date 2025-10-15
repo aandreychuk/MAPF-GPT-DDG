@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <queue>
 #include <vector>
+#include <unordered_set>
 
 // low-level search node
 struct LNode {
@@ -78,6 +79,10 @@ struct LaCAM {
   std::deque<HNode *> OPEN;
   int loop_cnt;
   
+  // Run-level statistics
+  uint64_t stats_generated = 0; // number of freshly generated nodes this run
+  uint64_t stats_merged = 0;    // number of nodes rebuilt from cached subtree this run
+  
   // Priority queue for f-value based expansion (used in solve_from_config)
   struct HNodeComparator {
     bool operator()(const HNode* a, const HNode* b) const {
@@ -94,6 +99,18 @@ struct LaCAM {
   const Instance *cache_ins = nullptr;  // to validate cache compatibility
   DistTable *cache_D = nullptr;
 
+  // solution suffix cache (solution graph): for any config, store best successor towards goal
+  std::unordered_map<Config, Config, ConfigHasher> BEST_SUCCESSOR_CACHE;
+  std::unordered_map<Config, int, ConfigHasher> REMAINING_G_CACHE; // remaining g to goal from this config
+  // full solution tree: all known successors from solutions (may have multiple)
+  std::unordered_map<Config, std::vector<Config>, ConfigHasher> SOL_TREE_SUCCESSORS;
+  // track current best solution path nodes and its cost
+  std::unordered_set<Config, ConfigHasher> BEST_SOLUTION_SET;
+  int BEST_SOLUTION_G = std::numeric_limits<int>::max();
+  // solution cache versioning to avoid splicing early in the same run
+  uint64_t current_run_version = 0;
+  uint64_t best_solution_version = 0; // version of BEST_SOLUTION_SET
+
   // Hyperparameters
   static bool ANYTIME;
   static float RANDOM_INSERT_PROB1;
@@ -102,12 +119,14 @@ struct LaCAM {
   LaCAM(const Instance *_ins, DistTable *_D, int _verbose = 0,
         const Deadline *_deadline = nullptr, int _seed = 0);
   ~LaCAM();
-  Solution solve();
-  // Start search from an arbitrary configuration while keeping the same goals
-  Solution solve_from_config(const Config &start);
+  Solution solve(const Config *custom_start = nullptr, float deadline_seconds = -1.0f);
   // Control cache reuse lifecycle
   void set_reuse_cache(bool enable) { reuse_cache = enable; }
   void clear_cache();
+  // Reset performance counters for fresh timing
+  void reset_counters();
+  // Helper function to push nodes in prioritized order
+  void push_prioritized(const std::vector<HNode*>& nodes);
   bool set_new_config(HNode *S, LNode *M, Config &Q_to);
   void rewrite(HNode *H_from, HNode *H_to);
   int get_g_val(HNode *H_parent, const Config &Q_to);
@@ -117,7 +136,13 @@ struct LaCAM {
   // Cache merging utilities
   void merge_cached_subtree(HNode *H_new, HNode *H_cached, 
                            std::unordered_map<Config, HNode *, ConfigHasher> &EXPLORED,
-                           HNodes &GC_HNodes);
+                           HNodes &GC_HNodes,
+                           std::unordered_set<Config, ConfigHasher> &merged_configs);
+
+  // Solution-suffix utilities
+  void cache_solution_suffix_from_goal(HNode *H_goal);
+  void build_spliced_solution_from_cached(HNode *prefix_end,
+                                          Solution &out_solution);
 
   // utilities
   template <typename... Body>
