@@ -33,14 +33,13 @@ else:
 #include <pybind11/stl.h>
 
 #include "planner.hpp"
-#include "lacam.hpp"
 
 namespace py = pybind11;
 
 // Simple stateful wrapper to hold instance and parameters between calls
 class LaCAMWrapper {
  public:
-  LaCAMWrapper() : seed_(0), verbose_(0), time_limit_ms_(0.0), dist_multi_thread_init_(true), anytime_(false), pibt_swap_(true), pibt_hindrance_(true), reuse_cache_(false) {}
+  LaCAMWrapper() : seed_(0), verbose_(0), time_limit_ms_(0.0), dist_multi_thread_init_(true), anytime_(false), pibt_swap_(true), pibt_hindrance_(true) {}
 
   void init(const std::vector<std::vector<int>> &grid,  // 0=free, 1=blocked
             const std::vector<std::pair<int, int>> &starts_rc,  // (row, col)
@@ -96,28 +95,26 @@ class LaCAMWrapper {
     anytime_ = anytime;
     pibt_swap_ = pibt_swap;
     pibt_hindrance_ = pibt_hindrance;
-    // construct DistTable and LaCAM for reuse across calls
-    DistTable::MULTI_THREAD_INIT = dist_multi_thread_init_;
-    dist_ = std::make_unique<DistTable>(*instance_);
-
-    deadline_ptr_.reset();
-    const Deadline *dl = nullptr;
-    if (time_limit_ms_ > 0.0) {
-      deadline_ptr_ = std::make_unique<Deadline>(time_limit_ms_);
-      dl = deadline_ptr_.get();
-    }
-    lacam_ = std::make_unique<LaCAM>(instance_.get(), dist_.get(), verbose_, dl, seed_);
-    LaCAM::ANYTIME = anytime_;
-    PIBT::SWAP = pibt_swap_;
-    PIBT::HINDRANCE = pibt_hindrance_;
-    lacam_->set_reuse_cache(reuse_cache_);
   }
 
   // Returns list of trajectories; each trajectory is a list of (x, y)
   std::vector<std::vector<std::pair<int, int>>> get_solution()
   {
-    if (!lacam_) throw std::runtime_error("call init() first");
-    auto solution = lacam_->solve(nullptr, deadline_ptr_.get()->time_limit_ms/1000.0);
+    if (!instance_) throw std::runtime_error("call init() first");
+
+    DistTable::MULTI_THREAD_INIT = dist_multi_thread_init_;
+    LaCAM::ANYTIME = anytime_;
+    PIBT::SWAP = pibt_swap_;
+    PIBT::HINDRANCE = pibt_hindrance_;
+
+    std::unique_ptr<Deadline> deadline_ptr;
+    const Deadline *deadline = nullptr;
+    if (time_limit_ms_ > 0.0) {
+      deadline_ptr = std::make_unique<Deadline>(time_limit_ms_);
+      deadline = deadline_ptr.get();
+    }
+
+    auto solution = solve(*instance_, verbose_, deadline, seed_);
 
     // Convert to trajectories of (x,y)
     // solution: vector<Config>; take per-agent positions over time
@@ -135,59 +132,9 @@ class LaCAMWrapper {
     return trajectories;
   }
 
-  void set_reuse_cache(bool enable)
-  {
-    reuse_cache_ = enable;
-    if (lacam_) lacam_->set_reuse_cache(enable);
-  }
-
-  void clear_cache()
-  {
-    if (lacam_) lacam_->clear_cache();
-  }
-
-  // Start from custom starts while keeping the same goals
-  std::vector<std::vector<std::pair<int, int>>> get_solution_from_starts(
-      const std::vector<std::pair<int, int>> &starts_rc, float deadline_seconds = -1.0f)
-  {
-    if (!lacam_) throw std::runtime_error("call init() first");
-    const int w = instance_->G.width;
-    const int h = instance_->G.height;
-    if ((int)starts_rc.size() != (int)instance_->N)
-      throw std::runtime_error("starts must match number of agents");
-    Config starts;
-    starts.reserve(instance_->N);
-    for (auto &p : starts_rc) {
-      int y = p.first;
-      int x = p.second;
-      if (x < 0 || x >= w || y < 0 || y >= h) throw std::runtime_error("start out of bounds");
-      auto v = instance_->G.U[w * y + x];
-      if (v == nullptr) throw std::runtime_error("start on blocked cell");
-      starts.push_back(v);
-    }
-
-    auto solution = lacam_->solve(&starts, deadline_seconds);
-
-    const size_t T = solution.size();
-    const size_t N = instance_->N;
-    std::vector<std::vector<std::pair<int, int>>> trajectories(N);
-    for (size_t i = 0; i < N; ++i) trajectories[i].reserve(T);
-    for (size_t t = 0; t < T; ++t) {
-      const auto &config = solution[t];
-      for (size_t i = 0; i < N; ++i) {
-        auto v = config[i];
-        trajectories[i].push_back({v->x, v->y});
-      }
-    }
-    return trajectories;
-  }
-
  private:
   std::unique_ptr<Graph> graph_;
   std::unique_ptr<Instance> instance_;
-  std::unique_ptr<DistTable> dist_;
-  std::unique_ptr<LaCAM> lacam_;
-  std::unique_ptr<Deadline> deadline_ptr_;
   int seed_;
   int verbose_;
   double time_limit_ms_;
@@ -195,7 +142,6 @@ class LaCAMWrapper {
   bool anytime_;
   bool pibt_swap_;
   bool pibt_hindrance_;
-  bool reuse_cache_;
 };
 
 PYBIND11_MODULE(lacam_py, m)
@@ -208,11 +154,5 @@ PYBIND11_MODULE(lacam_py, m)
            py::arg("seed") = 0, py::arg("verbose") = 0, py::arg("time_limit_sec") = 0.0,
            py::arg("multi_thread_dist_init") = true, py::arg("anytime") = false,
            py::arg("pibt_swap") = true, py::arg("pibt_hindrance") = true)
-      .def("get_solution", &LaCAMWrapper::get_solution)
-      .def("set_reuse_cache", &LaCAMWrapper::set_reuse_cache, py::arg("enable"))
-      .def("clear_cache", &LaCAMWrapper::clear_cache)
-      .def("get_solution_from_starts", &LaCAMWrapper::get_solution_from_starts, 
-           py::arg("starts_xy"), py::arg("deadline_seconds") = -1.0f);
+      .def("get_solution", &LaCAMWrapper::get_solution);
 }
-
-
