@@ -89,8 +89,14 @@ def generate_observations(gt_actions, grid, starts, targets, seeds):
     positions = starts
     moves = GridConfig().MOVES
     for i in range(len(gt_actions)):
-        observations.extend(observation_generator.generate_observations())
-        actions.extend((gt_actions[i], gt_actions[i+1] if i+1 < len(gt_actions) else 0, gt_actions[i+2] if i+2 < len(gt_actions) else 0))
+        current_observations = observation_generator.generate_observations()
+        observations.extend(current_observations)
+        num_agents = len(current_observations)
+        for agent_idx in range(num_agents):
+            a0 = gt_actions[i][agent_idx]
+            a1 = gt_actions[i+1][agent_idx] if i + 1 < len(gt_actions) else 0
+            a2 = gt_actions[i+2][agent_idx] if i + 2 < len(gt_actions) else 0
+            actions.append([a0, a1, a2])
         positions = [[positions[j][0] + moves[gt_actions[i][j]][0], positions[j][1] + moves[gt_actions[i][j]][1]] for j in range(len(positions))]
         observation_generator.update_agents(positions, targets, gt_actions[i])
     return observations, actions
@@ -116,8 +122,8 @@ def run_worker(files, log_path, dataset_path, samples_per_file, worker_id):
 
 def __main__():
     parser = argparse.ArgumentParser(description='Generate dataset')
-    parser.add_argument('--log_path', type=str, default='logs_mapf/mazes/num_agents_32', help='Path to the logs')
-    parser.add_argument('--dataset_path', type=str, default='dataset_mapf/mazes', help='Path to the dataset')
+    parser.add_argument('--log_path', type=str, default='logs_mapf/random/num_agents_32', help='Path to the logs')
+    parser.add_argument('--dataset_path', type=str, default='dataset_mapf/random', help='Path to the dataset')
     parser.add_argument('--samples_per_file', type=int, default=10000, help='Number of samples per file')
     parser.add_argument('--workers', type=int, default=1, help='Number of workers')
     args = parser.parse_args()

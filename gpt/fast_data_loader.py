@@ -54,7 +54,8 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         # shuffle data within the current file
         indices = np.random.permutation(len(input_tensors))
         input_tensors = np.stack(input_tensors[indices])
-        gt_actions = gt_actions[indices]
+        # `gt_actions` comes as an object array of Python lists; stack into a dense int8 array
+        gt_actions = np.stack(gt_actions[indices]).astype(np.int8, copy=False)
 
         return input_tensors, gt_actions
 
