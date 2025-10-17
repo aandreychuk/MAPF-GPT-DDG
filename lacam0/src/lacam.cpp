@@ -3,6 +3,7 @@
 bool LaCAM::ANYTIME = false;
 float LaCAM::RANDOM_INSERT_PROB1 = 0.001;
 float LaCAM::RANDOM_INSERT_PROB2 = 0.001;
+bool LaCAM::MAKESPAN_OBJECTIVE = false;
 
 bool CompareHNodePointers::operator()(const HNode *l, const HNode *r) const
 {
@@ -138,10 +139,10 @@ Solution LaCAM::solve()
     // do not pop here!
     auto H = OPEN.front();  // high-level node
 
-    // check uppwer bounds
-    if (H_goal != nullptr && H->g >= H_goal->g) {
+    // check upper bounds
+    if (H_goal != nullptr && H->f >= H_goal->f) {
       OPEN.pop_front();
-      solver_info(5, "prune, g=", H->g, " >= ", H_goal->g);
+      solver_info(5, "prune, f=", H->f, " >= ", H_goal->f);
       OPEN.push_front(H_init);
       continue;
     }
@@ -252,7 +253,18 @@ void LaCAM::rewrite(HNode *H_from, HNode *H_to)
     Q.pop();
     for (auto n_to : n_from->neighbors) {
       auto g_val = get_g_val(n_from, n_to->Q);
-      if (g_val < n_to->g) {
+      
+      bool should_update = false;
+      if (MAKESPAN_OBJECTIVE) {
+        if (n_from->depth + 1 < n_to->depth || 
+            (n_from->depth + 1 == n_to->depth && g_val < n_to->g)) {
+          should_update = true;
+        }
+      } else if (g_val < n_to->g) {
+          should_update = true;
+        }
+      
+      if (should_update) {
         if (n_to == H_goal) {
           solver_info(2, "cost update: g=", H_goal->g, " -> ", g_val,
                       ", depth=", H_goal->depth, " -> ", n_from->depth + 1);
@@ -279,7 +291,7 @@ void LaCAM::rewrite(HNode *H_from, HNode *H_to)
         Q.push(n_to);
         if (H_goal != nullptr && n_to->f < H_goal->f) {
           OPEN.push_front(n_to);
-          solver_info(4, "reinsert: g=", n_to->g, " < ", H_goal->g);
+          solver_info(4, "reinsert: f=", n_to->f, " < ", H_goal->f);
         }
       }
     }

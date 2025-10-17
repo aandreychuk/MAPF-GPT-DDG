@@ -33,13 +33,16 @@ else:
 #include <pybind11/stl.h>
 
 #include "planner.hpp"
+#include "dist_table.hpp"
+#include "pibt.hpp"
+#include "lacam.hpp"
 
 namespace py = pybind11;
 
 // Simple stateful wrapper to hold instance and parameters between calls
 class LaCAMWrapper {
  public:
-  LaCAMWrapper() : seed_(0), verbose_(0), time_limit_ms_(0.0), dist_multi_thread_init_(true), anytime_(false), pibt_swap_(true), pibt_hindrance_(true) {}
+  LaCAMWrapper() : seed_(0), verbose_(0), time_limit_ms_(0.0), dist_multi_thread_init_(true), anytime_(false), pibt_swap_(true), pibt_hindrance_(true), makespan_objective_(false) {}
 
   void init(const std::vector<std::vector<int>> &grid,  // 0=free, 1=blocked
             const std::vector<std::pair<int, int>> &starts_rc,  // (row, col)
@@ -50,7 +53,8 @@ class LaCAMWrapper {
             bool multi_thread_dist_init = true,
             bool anytime = false,
             bool pibt_swap = true,
-            bool pibt_hindrance = true)
+            bool pibt_hindrance = true,
+            bool makespan_objective = false)
   {
     const int h = (int)grid.size();
     const int w = h > 0 ? (int)grid[0].size() : 0;
@@ -95,6 +99,7 @@ class LaCAMWrapper {
     anytime_ = anytime;
     pibt_swap_ = pibt_swap;
     pibt_hindrance_ = pibt_hindrance;
+    makespan_objective_ = makespan_objective;
   }
 
   // Returns list of trajectories; each trajectory is a list of (x, y)
@@ -106,6 +111,7 @@ class LaCAMWrapper {
     LaCAM::ANYTIME = anytime_;
     PIBT::SWAP = pibt_swap_;
     PIBT::HINDRANCE = pibt_hindrance_;
+    LaCAM::MAKESPAN_OBJECTIVE = makespan_objective_;
 
     std::unique_ptr<Deadline> deadline_ptr;
     const Deadline *deadline = nullptr;
@@ -126,7 +132,7 @@ class LaCAMWrapper {
       const auto &config = solution[t];
       for (size_t i = 0; i < N; ++i) {
         auto v = config[i];
-        trajectories[i].push_back({v->x, v->y});
+        trajectories[i].push_back({v->y, v->x});
       }
     }
     return trajectories;
@@ -142,6 +148,7 @@ class LaCAMWrapper {
   bool anytime_;
   bool pibt_swap_;
   bool pibt_hindrance_;
+  bool makespan_objective_;
 };
 
 PYBIND11_MODULE(lacam_py, m)
@@ -153,6 +160,6 @@ PYBIND11_MODULE(lacam_py, m)
       .def("init", &LaCAMWrapper::init, py::arg("grid"), py::arg("starts_xy"), py::arg("goals_xy"),
            py::arg("seed") = 0, py::arg("verbose") = 0, py::arg("time_limit_sec") = 0.0,
            py::arg("multi_thread_dist_init") = true, py::arg("anytime") = false,
-           py::arg("pibt_swap") = true, py::arg("pibt_hindrance") = true)
+           py::arg("pibt_swap") = true, py::arg("pibt_hindrance") = true, py::arg("makespan_objective") = false)
       .def("get_solution", &LaCAMWrapper::get_solution);
 }

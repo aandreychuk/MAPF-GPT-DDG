@@ -79,6 +79,7 @@ struct LaCAM {
   static bool ANYTIME;
   static float RANDOM_INSERT_PROB1;
   static float RANDOM_INSERT_PROB2;
+  static bool MAKESPAN_OBJECTIVE;
 
   LaCAM(const Instance *_ins, DistTable *_D, int _verbose = 0,
         const Deadline *_deadline = nullptr, int _seed = 0);
