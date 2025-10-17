@@ -10,9 +10,6 @@ from loguru import logger
 from torch.utils.data import Dataset
 
 
-ACTION_HORIZON = 3
-
-
 class MapfArrowDataset(torch.utils.data.Dataset):
     def __init__(self, folder_path, device, batch_size):
         self.all_data_files = self.file_paths = sorted(glob.glob(os.path.join(folder_path, "*.arrow")))
@@ -32,10 +29,13 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         # pre-allocate memory for the input and target tensors (same file size)
         sample_input_tensors, sample_gt_actions = self._get_data_from_file(self.file_paths[0])
+        
+        # Determine action horizon dynamically from the loaded data
+        self.action_horizon = sample_gt_actions.shape[-1] if sample_gt_actions.ndim > 1 else 1
 
         self.input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
         self.target_tensors = torch.full(
-            sample_input_tensors.shape + (ACTION_HORIZON,),
+            sample_input_tensors.shape + (self.action_horizon,),
             -1,
             dtype=self.dtype,
             device=self.device,
@@ -43,6 +43,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         logger.info(
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
+        logger.info(f"Detected action horizon: {self.action_horizon}")
 
     @staticmethod
     def _get_data_from_file(file_path):
@@ -51,13 +52,25 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             input_tensors = table["input_tensors"].to_numpy()
             gt_actions = table["gt_actions"].to_numpy()
 
-        # shuffle data within the current file
-        indices = np.random.permutation(len(input_tensors))
-        input_tensors = np.stack(input_tensors[indices])
-        # `gt_actions` comes as an object array of Python lists; stack into a dense int8 array
-        gt_actions = np.stack(gt_actions[indices]).astype(np.int8, copy=False)
+        # Flatten the data: convert from List[timestep][agent][...] to List[agent_obs][...]
+        flattened_inputs = []
+        flattened_actions = []
+        
+        for t in range(len(input_tensors)):
+            for agent_idx in range(len(input_tensors[t])):
+                flattened_inputs.append(input_tensors[t][agent_idx])
+                flattened_actions.append(gt_actions[t][agent_idx])
 
-        return input_tensors, gt_actions
+        # Convert to numpy arrays
+        flattened_inputs = np.array(flattened_inputs)
+        flattened_actions = np.array(flattened_actions)
+
+        # shuffle data within the current file
+        indices = np.random.permutation(len(flattened_inputs))
+        flattened_inputs = flattened_inputs[indices]
+        flattened_actions = flattened_actions[indices]
+
+        return flattened_inputs, flattened_actions
 
     def load_and_transfer_data_file(self, filename):
         start_time = time.monotonic()
@@ -66,13 +79,17 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         self.input_tensors.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
         gt_actions_tensor = torch.tensor(gt_actions, dtype=self.dtype)
+        
+        # Ensure gt_actions has the correct shape for action_horizon
         if gt_actions_tensor.ndim == 1:
             gt_actions_tensor = gt_actions_tensor.unsqueeze(-1)
-        if gt_actions_tensor.size(-1) != ACTION_HORIZON:
+        if gt_actions_tensor.size(-1) != self.action_horizon:
             raise ValueError(
-                f"Expected gt_actions last dimension to be {ACTION_HORIZON}, got {gt_actions_tensor.size(-1)}"
+                f"Expected gt_actions last dimension to be {self.action_horizon}, got {gt_actions_tensor.size(-1)}"
             )
-        self.target_tensors[:, -1, :].copy_(gt_actions_tensor, non_blocking=True)
+        
+        # Copy the action tensor to the target tensor
+        self.target_tensors.copy_(gt_actions_tensor, non_blocking=True)
         finish_time = time.monotonic() - start_time
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
 

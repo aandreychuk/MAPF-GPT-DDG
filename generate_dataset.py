@@ -10,13 +10,15 @@ import argparse
 from multiprocessing import Pool
 
 def save_to_arrow(inputs, gt_actions, filepath):
+    # inputs: List[timestep][agent][int8]
+    # gt_actions: List[timestep][agent][int8]
     schema = pa.schema([
-        ('input_tensors', pa.list_(pa.int8())),
-        ('gt_actions', pa.list_(pa.int8()))
+        ('input_tensors', pa.list_(pa.list_(pa.int8()))),
+        ('gt_actions', pa.list_(pa.list_(pa.int8())))
     ])
 
-    input_tensors_col = pa.array(inputs, type=pa.list_(pa.int8()))
-    gt_actions_col = pa.array(gt_actions, type=pa.list_(pa.int8()))
+    input_tensors_col = pa.array(inputs, type=pa.list_(pa.list_(pa.int8())))
+    gt_actions_col = pa.array(gt_actions, type=pa.list_(pa.list_(pa.int8())))
     table = pa.Table.from_arrays([input_tensors_col, gt_actions_col], schema=schema)
 
     if not os.path.exists(os.path.dirname(filepath)):
@@ -25,50 +27,78 @@ def save_to_arrow(inputs, gt_actions, filepath):
         with ipc.new_file(f, schema) as writer:
             writer.write(table)
 
-def filter_and_balance_observations(observations, actions):
-    actions_array = np.array(actions, dtype=np.int8)
-    if actions_array.ndim == 1:
-        actions_array = actions_array[:, None]
+def filter_and_balance_timesteps(timestep_observations, timestep_actions, target_ratio=0.2):
+    """
+    Filter timesteps to reduce over-representation of zero actions.
+    Only considers the first action (a0) in each tuple for balancing.
 
-    horizon = actions_array.shape[1]
-    total_actions = len(actions_array) * horizon
-    zero_mask = actions_array == 0
-    total_zero_actions = int(zero_mask.sum())
+    - timestep_observations: List[timestep][agent][int8]
+    - timestep_actions: List[timestep][agent][int8] where per-agent action is a horizon tuple (length 10)
+    """
+    if len(timestep_actions) == 0:
+        return timestep_observations, timestep_actions
 
-    zero_tuple_mask = np.all(zero_mask, axis=1)
-    zero_tuple_indices = np.where(zero_tuple_mask)[0]
-    zero_tuple_count = int(zero_tuple_indices.size)
+    # Compute totals and per-timestep zero counts (only considering first action a0)
+    total_actions = 0
+    total_zero_actions = 0
+    per_timestep_stats = []  # (t_idx, zeros_in_t, total_in_t)
 
-    total_tuples = len(actions_array)
-    target_ratio = 0.2
+    for t_idx, actions_at_t in enumerate(timestep_actions):
+        if len(actions_at_t) == 0:
+            per_timestep_stats.append((t_idx, 0, 0))
+            continue
+        # Only consider the first action (a0) in each tuple
+        first_actions = [action_tuple[0] for action_tuple in actions_at_t]  # Extract a0 from each agent
+        zeros_in_t = int(sum(1 for a0 in first_actions if a0 == 0))
+        total_in_t = len(first_actions)
+        total_zero_actions += zeros_in_t
+        total_actions += total_in_t
+        per_timestep_stats.append((t_idx, zeros_in_t, total_in_t))
 
-    if zero_tuple_count == 0 or total_zero_actions <= target_ratio * total_actions:
-        filtered_indices = np.arange(total_tuples)
-        filtered_observations = [observations[i] for i in filtered_indices]
-        filtered_actions = actions_array[filtered_indices].tolist()
+    if total_actions == 0:
+        return timestep_observations, timestep_actions
+
+    if total_zero_actions <= target_ratio * total_actions:
+        return timestep_observations, timestep_actions
+
+    # Sort timesteps by zero count descending; remove greedily until balanced
+    removable = sorted(per_timestep_stats, key=lambda x: x[1], reverse=True)
+    keep_mask = np.ones(len(timestep_actions), dtype=bool)
+    total_removed = 0
+    for t_idx, zeros_in_t, total_in_t in removable:
+        if total_zero_actions <= target_ratio * total_actions:
+            break
+        # Remove this timestep
+        if total_in_t <= 0:
+            keep_mask[t_idx] = False
+            continue
+        keep_mask[t_idx] = False
+        total_zero_actions -= zeros_in_t
+        total_actions -= total_in_t
+        total_removed += total_in_t
+    filtered_obs = [timestep_observations[i] for i in range(len(timestep_observations)) if keep_mask[i]]
+    filtered_actions = [timestep_actions[i] for i in range(len(timestep_actions)) if keep_mask[i]]
+
+    '''
+    print("out of ", total_actions+total_removed, " timesteps, ", total_removed, " were removed")
+    action_counts = {}
+    for actions_at_t in filtered_actions:
+        for action_tuple in actions_at_t:
+            if action_tuple: # Ensure action_tuple is not empty
+                a0 = action_tuple[0]
+                action_counts[a0] = action_counts.get(a0, 0) + 1
+
+    total_filtered_actions = sum(action_counts.values())
+    if total_filtered_actions > 0:
+        print("Distribution of first actions (a0) in filtered dataset:")
+        for action_val in sorted(action_counts.keys()):
+            count = action_counts[action_val]
+            percentage = (count / total_filtered_actions) * 100
+            print(f"  Action {action_val}: {count} ({percentage:.2f}%)")
     else:
-        numerator = total_zero_actions - target_ratio * total_actions
-        remove_tuple_count = math.ceil(numerator / ((1 - target_ratio) * horizon))
-        remove_tuple_count = min(max(remove_tuple_count, 0), zero_tuple_count)
-
-        keep_mask = np.ones(total_tuples, dtype=bool)
-        if remove_tuple_count > 0:
-            remove_indices = zero_tuple_indices[:remove_tuple_count]
-            keep_mask[remove_indices] = False
-
-        filtered_indices = np.where(keep_mask)[0]
-        filtered_observations = [observations[i] for i in filtered_indices]
-        filtered_actions = actions_array[filtered_indices].tolist()
-    final_observations = []
-    final_actions = []
-    check_obs = set()
-    for i, obs in enumerate(filtered_observations):
-        if tuple(obs) not in check_obs:
-            check_obs.add(tuple(obs))
-            final_observations.append(obs)
-            final_actions.append(filtered_actions[i])
-
-    return final_observations, final_actions
+        print("No actions in filtered dataset.")
+    '''
+    return filtered_obs, filtered_actions
 
 def get_data_from_file(file_path):
     with pa.memory_map(file_path) as source:
@@ -84,40 +114,53 @@ def generate_observations(gt_actions, grid, starts, targets, seeds):
     observation_generator = ObservationGenerator(grid, 3, 64)
     observation_generator.create_agents(starts, targets)
     observation_generator.update_agents(starts, targets, [-1 for _ in range(len(starts))])
-    observations = []
-    actions = []
+    # Accumulate per-timestep lists
+    observations = []  # List[t][agent][...]
+    actions = []       # List[t][agent][a0,a1,a2,...,a9] (10 actions)
     positions = starts
     moves = GridConfig().MOVES
     for i in range(len(gt_actions)):
         current_observations = observation_generator.generate_observations()
-        observations.extend(current_observations)
+        observations.append(current_observations)
         num_agents = len(current_observations)
+        timestep_actions = []
         for agent_idx in range(num_agents):
-            a0 = gt_actions[i][agent_idx]
-            a1 = gt_actions[i+1][agent_idx] if i + 1 < len(gt_actions) else 0
-            a2 = gt_actions[i+2][agent_idx] if i + 2 < len(gt_actions) else 0
-            actions.append([a0, a1, a2])
+            # Create action tuple with 10 actions (a0 through a9)
+            action_tuple = []
+            for j in range(10):
+                if i + j < len(gt_actions):
+                    action_tuple.append(gt_actions[i + j][agent_idx])
+                else:
+                    action_tuple.append(0)  # Pad with 0 if beyond available timesteps
+            timestep_actions.append(action_tuple)
+        actions.append(timestep_actions)
         positions = [[positions[j][0] + moves[gt_actions[i][j]][0], positions[j][1] + moves[gt_actions[i][j]][1]] for j in range(len(positions))]
         observation_generator.update_agents(positions, targets, gt_actions[i])
     return observations, actions
 
 def run_worker(files, log_path, dataset_path, samples_per_file, worker_id):
-    all_observations = []
-    all_actions = []
+    # Buffers hold timesteps
+    all_observations = []  # List[t][agent][...]
+    all_actions = []       # List[t][agent][a0,a1,a2,...,a9] (10 actions)
     part_id = 0
     for file in files:
         file_path = os.path.join(log_path, file)
         gt_actions, grid, starts, targets, seeds = get_data_from_file(file_path)
         for i in range(len(gt_actions)):
             observations, actions = generate_observations(gt_actions[i], grid[i], starts[i], targets[i], seeds[i])
-            filtered_observations, filtered_actions = filter_and_balance_observations(observations, actions)
-            all_observations.extend(filtered_observations)
-            all_actions.extend(filtered_actions)
-            if len(all_observations) >= samples_per_file:
-                save_to_arrow(all_observations[:samples_per_file], all_actions[:samples_per_file], os.path.join(dataset_path, f"part_{worker_id}_{part_id}.arrow"))
-                all_observations = all_observations[samples_per_file:]
-                all_actions = all_actions[samples_per_file:]
-                part_id += 1
+            # Append raw timesteps first; filter later when buffer big enough
+            all_observations.extend(observations)
+            all_actions.extend(actions)
+
+            # Trigger filtering when buffer exceeds 2x samples_per_file timesteps
+            if len(all_observations) >= 2 * samples_per_file:
+                all_observations, all_actions = filter_and_balance_timesteps(all_observations, all_actions)
+                # Save when enough timesteps available
+                if len(all_observations) >= samples_per_file:
+                    save_to_arrow(all_observations[:samples_per_file], all_actions[:samples_per_file], os.path.join(dataset_path, f"part_{worker_id}_{part_id}.arrow"))
+                    all_observations = all_observations[samples_per_file:]
+                    all_actions = all_actions[samples_per_file:]
+                    part_id += 1
         print(f"{file} processed")
 
 def __main__():
