@@ -198,7 +198,13 @@ class GPT(nn.Module):
                         ignore_index=-1,
                     )
                 )
-            loss = torch.stack(losses).mean()
+            losses = torch.stack(losses)
+            # Weighted loss: (4*a0 + 2*a1 + 1*a2) / 7
+            if self.action_horizon == 3:
+                weights = torch.tensor([4.0, 2.0, 1.0], device=losses.device, dtype=losses.dtype)
+                loss = (losses[:3] * weights).sum() / weights.sum()
+            else:
+                loss = losses.mean()
         else:
             logits = logits[:, [-1], :, :]
             loss = None
