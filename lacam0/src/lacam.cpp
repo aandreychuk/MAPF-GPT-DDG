@@ -140,11 +140,28 @@ Solution LaCAM::solve()
     auto H = OPEN.front();  // high-level node
 
     // check upper bounds
-    if (H_goal != nullptr && H->f >= H_goal->f) {
-      OPEN.pop_front();
-      solver_info(5, "prune, f=", H->f, " >= ", H_goal->f);
-      OPEN.push_front(H_init);
-      continue;
+    if (H_goal != nullptr) {
+      bool should_prune = false;
+      if (MAKESPAN_OBJECTIVE) {
+        // for makespan: prune if depth + h_makespan >= current best depth
+        auto h_makespan = get_h_makespan(H->Q);
+        if (H->depth + h_makespan >= H_goal->depth) {
+          should_prune = true;
+          solver_info(5, "prune (makespan), depth+h=", H->depth + h_makespan, " >= ", H_goal->depth);
+        }
+      } else {
+        // for SOC: prune if f >= current best f
+        if (H->f >= H_goal->f) {
+          should_prune = true;
+          solver_info(5, "prune (SOC), f=", H->f, " >= ", H_goal->f);
+        }
+      }
+      
+      if (should_prune) {
+        OPEN.pop_front();
+        OPEN.push_front(H_init);
+        continue;
+      }
     }
 
     // check goal condition
@@ -289,9 +306,26 @@ void LaCAM::rewrite(HNode *H_from, HNode *H_to)
         }
         
         Q.push(n_to);
-        if (H_goal != nullptr && n_to->f < H_goal->f) {
-          OPEN.push_front(n_to);
-          solver_info(4, "reinsert: f=", n_to->f, " < ", H_goal->f);
+        if (H_goal != nullptr) {
+          bool should_reinsert = false;
+          if (MAKESPAN_OBJECTIVE) {
+            // for makespan: reinsert if depth + h_makespan < current best depth
+            auto h_makespan = get_h_makespan(n_to->Q);
+            if (n_to->depth + h_makespan < H_goal->depth) {
+              should_reinsert = true;
+              solver_info(4, "reinsert (makespan): depth+h=", n_to->depth + h_makespan, " < ", H_goal->depth);
+            }
+          } else {
+            // for SOC: reinsert if f < current best f
+            if (n_to->f < H_goal->f) {
+              should_reinsert = true;
+              solver_info(4, "reinsert (SOC): f=", n_to->f, " < ", H_goal->f);
+            }
+          }
+          
+          if (should_reinsert) {
+            OPEN.push_front(n_to);
+          }
         }
       }
     }
@@ -325,6 +359,15 @@ int LaCAM::get_h_val(const Config &Q)
   auto c = 0;
   for (size_t i = 0; i < ins->N; ++i) c += D->get(i, Q[i]);
   return c;
+}
+
+int LaCAM::get_h_makespan(const Config &Q)
+{
+  auto max_dist = 0;
+  for (size_t i = 0; i < ins->N; ++i) {
+    max_dist = std::max(max_dist, D->get(i, Q[i]));
+  }
+  return max_dist;
 }
 
 int LaCAM::get_edge_cost(const Config &Q1, const Config &Q2)

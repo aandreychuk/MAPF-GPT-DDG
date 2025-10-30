@@ -89,6 +89,7 @@ struct LaCAM {
   void rewrite(HNode *H_from, HNode *H_to);
   int get_g_val(HNode *H_parent, const Config &Q_to);
   int get_h_val(const Config &Q);
+  int get_h_makespan(const Config &Q);
   int get_edge_cost(const Config &Q1, const Config &Q2);
 
   // utilities
