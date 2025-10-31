@@ -46,6 +46,7 @@ public:
     std::vector<std::vector<std::vector<int>>> obs_buffer; // Buffer for each agent
     std::vector<std::vector<int>> grid;
     std::unordered_map<std::pair<int, int>, std::vector<std::vector<int8_t>>, HashPair> cost2go_cache;
+    std::vector<std::vector<int>> agents_in_observation; // Cache for agent IDs visible to each agent
     ObservationGenerator(const std::vector<std::vector<int>> &grid, int obs_radius, int context_size)
         : grid(grid), obs_radius(obs_radius), context_size(context_size)
     {
@@ -63,4 +64,5 @@ public:
 #endif
     void display_cost2go_matrix(const std::pair<int, int> &goal, bool use_unicode = true);
     void display_observation(int agent_idx);
+    std::vector<std::vector<int>> get_agents_ids_in_observations();
 };

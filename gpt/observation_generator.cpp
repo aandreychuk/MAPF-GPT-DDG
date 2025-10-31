@@ -92,6 +92,9 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
     const auto &goal = agent.goal;
     const auto &pos = agent.pos;
     
+    agents_in_observation[agent_idx].clear();
+    std::vector<int> agents_in_observation_distances;
+    
     // Fill the observation buffer with unified encoding
     for (int i = 0; i <= obs_radius * 2; i++)
     {
@@ -113,6 +116,8 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
                 {
                     // Agent present - encode agent information
                     buffer[i][j] = 16 + agents[agent_at_pos].last_action * 16 + agents[agent_at_pos].next_action;
+                    agents_in_observation[agent_idx].push_back(agent_at_pos);
+                    agents_in_observation_distances.push_back(abs(i - obs_radius) + abs(j - obs_radius));
                 }
                 else
                 {
@@ -122,6 +127,10 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
             }
         }
     }
+    auto &inner = agents_in_observation[agent_idx];
+    std::sort(inner.begin(), inner.end(), [&](int lhs, int rhs) {
+        return agents_in_observation_distances[lhs] < agents_in_observation_distances[rhs];
+    });
 }
 
 void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals)
@@ -130,6 +139,7 @@ void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> 
     int total_agents = positions.size();
     agents.resize(total_agents);
     obs_buffer.resize(total_agents, std::vector<std::vector<int>>(2 * obs_radius + 1, std::vector<int>(2 * obs_radius + 1)));
+    agents_in_observation.resize(total_agents);
     
     for (int i = 0; i < total_agents; i++)
     {
@@ -497,6 +507,11 @@ void ObservationGenerator::display_observation(int agent_idx)
     }
 }
 
+std::vector<std::vector<int>> ObservationGenerator::get_agents_ids_in_observations()
+{
+    return agents_in_observation;
+}
+
 int main()
 {
     // Create a smaller grid for testing (20x20)
@@ -555,6 +570,17 @@ int main()
         std::cout << "\n";
     }
     
+    std::cout << "\n" << std::string(60, '-') << "\n";
+    std::cout << "Agent IDs in observations:\n";
+    for (int i = 0; i < 3; i++) {
+        auto agent_ids = obs_gen.get_agents_ids_in_observations();
+        std::cout << "Agent " << i << " sees agents: ";
+        for (size_t j = 0; j < agent_ids.size(); j++) {
+            std::cout << agent_ids[i][j] << " ";
+        }
+        std::cout << "\n";
+    }
+    
     return 0;
 }
 
@@ -567,7 +593,8 @@ PYBIND11_MODULE(observation_generator, m)
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)
         .def("generate_observations", &ObservationGenerator::generate_observations)
-        .def("generate_observations_numpy", &ObservationGenerator::generate_observations_numpy);
+        .def("generate_observations_numpy", &ObservationGenerator::generate_observations_numpy)
+        .def("get_agents_ids_in_observations", &ObservationGenerator::get_agents_ids_in_observations);
 }
 /*
 <%
