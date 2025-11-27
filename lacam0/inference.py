@@ -13,6 +13,7 @@ class LaCAM0InferenceConfig(AlgoBase, extra=Extra.forbid):
     anytime: bool = True
     pibt_swap: bool = True
     pibt_hindrance: bool = True
+    makespan_objective: bool = False
 
 
 class LaCAM0Inference:
@@ -33,20 +34,30 @@ class LaCAM0Inference:
                                        anytime=self.cfg.anytime,
                                        pibt_swap=self.cfg.pibt_swap,
                                        pibt_hindrance=self.cfg.pibt_hindrance,
-                                       verbose=3)
+                                       verbose=0,
+                                       makespan_objective=self.cfg.makespan_objective)
             self.solution = lacam.get_solution()
+
         moves = {tuple(move):i for i, move in enumerate(GridConfig().MOVES)}
         actions = []
         for i in range(len(observations)):
             if len(self.solution[i]) - 1 > self.step:
                 p0 = self.solution[i][self.step]
                 p1 = self.solution[i][self.step+1]
-                actions.append(moves[p1[1] - p0[1], p1[0] - p0[0]])
+                actions.append(moves[p1[0] - p0[0], p1[1] - p0[1]])
             else:
                 actions.append(0)
         self.step += 1
         return actions
-            
+    
+    def get_full_solution(self, observations, max_episode_steps):
+        actions = []
+        for _ in range(max_episode_steps):
+            step_actions = self.act(observations)
+            if all(action == 0 for action in step_actions):
+                break
+            actions.append(step_actions)
+        return actions, observations[0]["global_obstacles"].copy().astype(int).tolist(), [obs["global_xy"] for obs in observations], [obs["global_target_xy"] for obs in observations]
 
     def reset_states(self):
         self.solution = None

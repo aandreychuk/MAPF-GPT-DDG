@@ -15,6 +15,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from lacam.inference import LacamInference, LacamInferenceConfig
+from lacam0.inference import LaCAM0Inference, LaCAM0InferenceConfig
 from dataset_generator.instance_generator import make_pogema_maze_instance, make_pogema_random_instance, make_pogema_house_instance
 
 def save_to_arrow_with_grid(gt_actions, grid, starts, targets, seeds, filepath):
@@ -37,13 +38,14 @@ def save_to_arrow_with_grid(gt_actions, grid, starts, targets, seeds, filepath):
         with ipc.new_file(f, schema) as writer:
             writer.write(table)
 
-def get_solved_instance(env):
-    expert_algo = LacamInference(LacamInferenceConfig(time_limit=10, timeouts=[10]))
+def get_solved_instance(env, makespan_objective=False):
+    #expert_algo = LacamInference(LacamInferenceConfig(time_limit=10, timeouts=[10]))
+    expert_algo = LaCAM0Inference(LaCAM0InferenceConfig(time_limit=10, makespan_objective=makespan_objective))
     observations, *_ = env.reset()
     actions, grid, starts, targets = expert_algo.get_full_solution(observations, env.grid_config.max_episode_steps)
     return actions, grid, starts, targets
 
-def run_worker(seeds, worker_id, instance_type, data_per_file, num_agents, dataset_path, files_per_worker, progress_dict=None, save_instances=False):
+def run_worker(seeds, worker_id, instance_type, data_per_file, num_agents, dataset_path, files_per_worker, progress_dict=None, makespan_objective=False):
     all_gt_actions = []
     all_grids = []
     all_starts = []
@@ -79,7 +81,7 @@ def run_worker(seeds, worker_id, instance_type, data_per_file, num_agents, datas
             env = make_pogema_random_instance(num_agents=num_agents, max_episode_steps=256, map_seed=seed, scenario_seed=seed, on_target='nothing')
         elif instance_type == 'house':
             env = make_pogema_house_instance(num_agents=num_agents, max_episode_steps=256, map_seed=seed, scenario_seed=seed, on_target='nothing')
-        gt_actions, grid, starts, targets = get_solved_instance(env)
+        gt_actions, grid, starts, targets = get_solved_instance(env, makespan_objective)
         instances_processed += 1
         
         if gt_actions is None:
@@ -165,6 +167,7 @@ def main():
     parser.add_argument('--path', type=str, default='gt_data_mapf', help='Path to save the gt data')
     parser.add_argument('--workers', type=int, default=1, help='Number of worker processes')
     parser.add_argument('--total_files', type=int, default=512, help='Total number of files to generate')
+    parser.add_argument('--makespan_objective', action='store_true', help='Use makespan objective')
     args = parser.parse_args()
 
     files_per_worker = args.total_files // args.workers
@@ -177,7 +180,7 @@ def main():
     
     # Prepare worker arguments as tuples
     worker_args = [
-        (seeds[i * seeds_per_worker:(i + 1) * seeds_per_worker], i, args.instance_type, args.data_per_file, args.num_agents, args.dataset_path, files_per_worker, progress_dict)
+        (seeds[i * seeds_per_worker:(i + 1) * seeds_per_worker], i, args.instance_type, args.data_per_file, args.num_agents, args.path, files_per_worker, progress_dict, args.makespan_objective)
         for i in range(args.workers)
     ]
     
