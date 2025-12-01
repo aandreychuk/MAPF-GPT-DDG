@@ -171,12 +171,13 @@ def __main__():
     parser.add_argument('--dataset_path', type=str, default='dataset_mapf/random', help='Path to the dataset')
     parser.add_argument('--samples_per_file', type=int, default=1000, help='Number of samples per file')
     parser.add_argument('--workers', type=int, default=1, help='Number of workers')
+    parser.add_argument('--observation_type', type=str, default='cost2go', help='Observation type')
     args = parser.parse_args()
     file_path = args.log_path
     files = os.listdir(file_path)
     files_per_worker = len(files) // args.workers
     with Pool(args.workers) as p:
-        p.starmap(run_worker, [(files[i * files_per_worker:(i + 1) * files_per_worker], args.log_path, args.dataset_path, args.samples_per_file, i) for i in range(args.workers)])
+        p.starmap(run_worker, [(files[i * files_per_worker:(i + 1) * files_per_worker], args.log_path, args.dataset_path, args.samples_per_file, i, args.observation_type) for i in range(args.workers)])
     print("DONE")
 
 if __name__ == "__main__":
