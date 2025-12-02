@@ -568,7 +568,6 @@ PYBIND11_MODULE(observation_generator_directions, m)
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)
         .def("generate_observations", &ObservationGenerator::generate_observations)
-        .def("generate_observations_numpy", &ObservationGenerator::generate_observations_numpy)
         .def("get_agents_ids_in_observations", &ObservationGenerator::get_agents_ids_in_observations);
 }
 /*
