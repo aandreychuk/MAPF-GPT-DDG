@@ -1,7 +1,7 @@
 from loguru import logger
 import torch
-from torch.utils.data import Dataset
 
+from torch.utils.data import Dataset
 from gpt.fast_data_loader import MapfArrowDataset
 
 
@@ -33,8 +33,8 @@ class AggregatedMapfArrowDataset(Dataset):
         dataset_iters = [iter(dataset) for dataset in self.datasets]
 
         while True:
-            batch_inputs, batch_targets = zip(*[next(dataset_iter) for dataset_iter in dataset_iters])
-            yield torch.cat(batch_inputs, dim=0), torch.cat(batch_targets, dim=0)
+            batch_inputs, batch_targets, batch_agents = zip(*[next(dataset_iter) for dataset_iter in dataset_iters])
+            yield torch.cat(batch_inputs, dim=0), torch.cat(batch_targets, dim=0), torch.cat(batch_agents, dim=0)
 
     def get_full_dataset_size(self):
         return sum(dataset.get_full_dataset_size() for dataset in self.datasets)
@@ -44,9 +44,8 @@ class AggregatedMapfArrowDataset(Dataset):
 
 
 def main():
-    folder_paths = ["../dataset/train", "../dataset/validation"]
-    # folder_paths = ["../dataset/train", "../dagger"]
-    batch_sizes = [24, 8]  # Exact batch sizes for train and validation datasets
+    folder_paths = ["../dataset/train/mazes", "../dataset/train/random", "../dataset/train/house"]
+    batch_sizes = [16, 8, 8]  # Exact batch sizes for train and validation datasets
     aggregated_dataset = AggregatedMapfArrowDataset(folder_paths, device='cuda:0', batch_sizes=batch_sizes)
     data = iter(aggregated_dataset)
 
@@ -56,9 +55,13 @@ def main():
     x = 0
     while True:
         x += 1
-        qx, qy = next(data)
-        # logger.info(str(qx.shape) + ' ' + str(qy.shape))
-
+        observations, actions, agent_chat_ids = next(data)
+        # logger.info(str(qx.shape) + ' ' + str(qy.shape) + ' ' + str(qz.shape))
+        logger.info(str(observations.shape) + ' ' + str(actions.shape) + ' ' + str(agent_chat_ids.shape))
+        logger.info('Tokenized observation example:' + str(observations[0][0]))
+        logger.info('Action:' +str(actions[0][0]))
+        logger.info('Chat ids:' + str(agent_chat_ids[0][0]))
+        exit(0)
 
 if __name__ == "__main__":
     main()

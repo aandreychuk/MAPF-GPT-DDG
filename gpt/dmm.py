@@ -250,7 +250,7 @@ class DMMConfig:
     action_msg_feats: int = 16
     empty_connection_code: int = -1
     n_comm_rounds: int = 2
-    num_action_heads: int = 1  # Number of action predictions to make
+    num_action_heads: int = 3  # Number of action predictions to make
     loss_weights: list = None  # Weights for each action head loss (e.g., [4, 2, 1] for 3 heads)
 
 
@@ -441,36 +441,38 @@ class DMM(nn.Module):
                 f"Number of loss weights ({len(config.loss_weights)}) must match num_action_heads ({config.num_action_heads})"
             self.loss_weights = config.loss_weights
 
-    def forward(self, observations, agent_chat_ids, target_actions=None):
-        B, C, T = observations.shape
-        observations = observations.view(B * C, T)
+    def forward(self, observations, target_actions=None):
+        B, T = observations.shape
         
         latent = self.representation_encoder(observations)
         act_msg_latent = self.representation_decoder(latent)
-        decoder_output = act_msg_latent.squeeze(1)  # (B*C, action_msg_feats)
+        decoder_output = act_msg_latent.squeeze(1)  # (B, action_msg_feats)
         
         # Generate predictions from all action heads
         action_logits_list = []
         for action_head in self.action_heads:
             action_logits_list.append(action_head(decoder_output))
         
-        # Stack to shape (B*C, num_action_heads, 5) or (B*C, 5) if single head
+        # Stack to shape (B, num_action_heads, 5) or (B, 5) if single head
         if self.num_action_heads == 1:
             action_logits = action_logits_list[0]
         else:
-            action_logits = torch.stack(action_logits_list, dim=1)  # (B*C, num_action_heads, 5)
+            action_logits = torch.stack(action_logits_list, dim=1)  # (B, num_action_heads, 5)
         
         if target_actions is not None:
-            # Reshape target_actions from (B, C, num_action_heads) to (B*C, num_action_heads)
-            # or handle (B*C, num_action_heads) directly
-            if target_actions.dim() == 3:
-                target_actions = target_actions.view(B * C, -1)
+            # Handle target_actions: (B, num_action_heads) or (B, action_horizon)
+            if target_actions.dim() == 2:
+                # If shape is (B, action_horizon), we expect it to match num_action_heads
+                if target_actions.size(-1) != self.num_action_heads:
+                    raise ValueError(
+                        f"target_actions last dimension {target_actions.size(-1)} != num_action_heads {self.num_action_heads}"
+                    )
             elif target_actions.dim() == 1:
                 # Single action per sample - expand to match num_action_heads
                 target_actions = target_actions.unsqueeze(1).expand(-1, self.num_action_heads)
             
-            assert target_actions.shape == (B * C, self.num_action_heads), \
-                f"target_actions shape {target_actions.shape} != (B*C={B*C}, num_action_heads={self.num_action_heads})"
+            assert target_actions.shape == (B, self.num_action_heads), \
+                f"target_actions shape {target_actions.shape} != (B={B}, num_action_heads={self.num_action_heads})"
             
             # Compute weighted loss for each action head
             losses = []
@@ -524,15 +526,15 @@ class DMM(nn.Module):
         return optimizer
 
     @torch.no_grad()
-    def act(self, obs, agent_chat_ids, do_sample=True):
-        logits, _ = self(obs, agent_chat_ids)
+    def act(self, obs, do_sample=True):
+        logits, _ = self(obs)
 
         # During inference, only use the first action head
         if self.num_action_heads > 1:
-            # logits shape: (B*C, num_action_heads, 5)
-            first_head_logits = logits[:, 0, :]  # (B*C, 5)
+            # logits shape: (B, num_action_heads, 5)
+            first_head_logits = logits[:, 0, :]  # (B, 5)
         else:
-            # logits shape: (B*C, 5)
+            # logits shape: (B, 5)
             first_head_logits = logits
 
         probs = F.softmax(first_head_logits, dim=-1)
@@ -545,13 +547,12 @@ class DMM(nn.Module):
     
 
     def encode(self, observations):
-        B, C, T = observations.shape
+        B, T = observations.shape
         device = observations.device
-        observations = observations.view(B * C, T)
 
         latent = self.representation_encoder(observations)
         _, T_l, N_l = latent.shape
-        return latent.view(B, C, T_l, N_l)
+        return latent.view(B, 1, T_l, N_l)
 
 
 
@@ -571,11 +572,11 @@ class DMM_RLWrapper(nn.Module):
         self.latent_embd = config.latent_embd
 
     @torch.no_grad()
-    def act(self, obs, agent_chat_ids, do_sample=True):
-        device = agent_chat_ids.device
+    def act(self, obs, do_sample=True):
+        device = obs.device
         latent = self.encode(obs)
         
-        mean, sigma = self(latent, agent_chat_ids)
+        mean, sigma = self(latent)
         latent_size = sigma.shape[-1]
         b, _ = sigma.shape
 
@@ -601,7 +602,7 @@ class DMM_RLWrapper(nn.Module):
     def encode(self, observations):
         return self.dmm.encode(observations)
     
-    def forward(self, latent, agent_chat_ids):
+    def forward(self, latent):
         _, _, T_l, N_l = latent.shape
         latent = latent.view(-1, T_l, N_l)
 

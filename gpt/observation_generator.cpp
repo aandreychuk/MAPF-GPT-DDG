@@ -148,6 +148,141 @@ Encoder::Encoder(const InputParameters &cfg) : cfg(cfg)
         inverse_str_vocab[idx] = token;
 }
 
+Decoder::Decoder(const InputParameters &cfg) : cfg(cfg)
+{
+    // Mirror Encoder vocabulary construction so that decoding is consistent
+    for (int i = -cfg.cost2go_value_limit; i <= cfg.cost2go_value_limit; ++i)
+        coord_range.push_back(i);
+    coord_range.push_back(-cfg.cost2go_value_limit * 4);
+    coord_range.push_back(-cfg.cost2go_value_limit * 2);
+    coord_range.push_back(cfg.cost2go_value_limit * 2);
+
+    actions_range = {'n', 'w', 'u', 'd', 'l', 'r'};
+    for (int i = 0; i < 16; ++i)
+    {
+        std::stringstream ss;
+        ss << std::bitset<4>(i);
+        next_action_range.push_back(ss.str());
+    }
+
+    int idx = 0;
+    for (auto &token : coord_range)
+        int_vocab[token] = idx++;
+    for (auto &token : actions_range)
+        str_vocab[std::string(1, token)] = idx++;
+    for (auto &token : next_action_range)
+        str_vocab[token] = idx++;
+    str_vocab["!"] = idx;
+
+    for (auto &[token, idx_val] : int_vocab)
+        inverse_int_vocab[idx_val] = token;
+    for (auto &[token, idx_val] : str_vocab)
+        inverse_str_vocab[idx_val] = token;
+}
+
+std::pair<std::vector<std::vector<int>>, std::vector<AgentsInfo>>
+Decoder::decode(const std::vector<int> &encoded) const
+{
+    const int side = 2 * cfg.obs_radius + 1;
+    const int num_cells = side * side;
+
+    if (static_cast<int>(encoded.size()) < num_cells)
+    {
+        throw std::runtime_error("Encoded observation too short to contain cost2go matrix");
+    }
+
+    std::vector<std::vector<int>> cost2go(side, std::vector<int>(side, 0));
+    for (int i = 0; i < side; ++i)
+    {
+        for (int j = 0; j < side; ++j)
+        {
+            int flat_idx = i * side + j;
+            int token_idx = encoded[flat_idx];
+            auto it = inverse_int_vocab.find(token_idx);
+            if (it == inverse_int_vocab.end())
+            {
+                throw std::runtime_error("Unknown index in cost2go portion of encoded observation");
+            }
+            cost2go[i][j] = it->second;
+        }
+    }
+
+    const int block_len = 5 + cfg.num_previous_actions;
+    const int total_agents_region = cfg.num_agents * block_len;
+    const int pad_idx = str_vocab.at("!");
+
+    std::vector<AgentsInfo> agents;
+    int offset = num_cells;
+
+    // Don't read past available data, even if padded context_size was truncated
+    int max_available = static_cast<int>(encoded.size()) - offset;
+    int readable_agents_region = std::min(max_available, total_agents_region);
+
+    for (int a = 0; a < cfg.num_agents; ++a)
+    {
+        int base = offset + a * block_len;
+        if (base + block_len > offset + readable_agents_region)
+            break;
+
+        bool all_pad = true;
+        for (int t = 0; t < block_len; ++t)
+        {
+            if (encoded[base + t] != pad_idx)
+            {
+                all_pad = false;
+                break;
+            }
+        }
+        if (all_pad)
+        {
+            // Remaining agent slots are padding
+            break;
+        }
+
+        // Decode coordinates (relative position and relative goal)
+        auto decode_coord = [this](int idx_val) -> int {
+            auto it = inverse_int_vocab.find(idx_val);
+            if (it == inverse_int_vocab.end())
+                throw std::runtime_error("Unknown index in coord portion of encoded observation");
+            return it->second;
+        };
+
+        int rel_pos_x = decode_coord(encoded[base + 0]);
+        int rel_pos_y = decode_coord(encoded[base + 1]);
+        int rel_goal_x = decode_coord(encoded[base + 2]);
+        int rel_goal_y = decode_coord(encoded[base + 3]);
+
+        // Decode previous actions
+        std::deque<std::string> prev_actions;
+        for (int t = 0; t < cfg.num_previous_actions; ++t)
+        {
+            int token_idx = encoded[base + 4 + t];
+            auto it = inverse_str_vocab.find(token_idx);
+            if (it == inverse_str_vocab.end())
+                throw std::runtime_error("Unknown index in previous actions portion of encoded observation");
+            const std::string &act = it->second;
+            // Skip padding markers just in case; encoder never writes them here for real agents
+            if (act != "!")
+                prev_actions.push_back(act);
+        }
+
+        // Decode next action
+        int next_action_idx = encoded[base + 4 + cfg.num_previous_actions];
+        auto it_next = inverse_str_vocab.find(next_action_idx);
+        if (it_next == inverse_str_vocab.end())
+            throw std::runtime_error("Unknown index in next action portion of encoded observation");
+        std::string next_action = it_next->second;
+
+        agents.emplace_back(
+            std::make_pair(rel_pos_x, rel_pos_y),
+            std::make_pair(rel_goal_x, rel_goal_y),
+            prev_actions,
+            next_action);
+    }
+
+    return {cost2go, agents};
+}
+
 std::vector<int> Encoder::encode(const std::vector<AgentsInfo> &agents, const std::vector<std::vector<int>> &cost2go)
 {
     std::vector<int> agents_indices;
@@ -371,6 +506,19 @@ PYBIND11_MODULE(observation_generator, m)
         .def_readwrite("agents_radius", &InputParameters::agents_radius)
         .def_readwrite("context_size", &InputParameters::context_size)
         .def_readwrite("obs_radius", &InputParameters::obs_radius);
+
+    py::class_<AgentsInfo>(m, "AgentsInfo")
+        .def(py::init<>())
+        .def(py::init<std::pair<int, int>, std::pair<int, int>, std::deque<std::string>, std::string>())
+        .def_readwrite("relative_pos", &AgentsInfo::relative_pos)
+        .def_readwrite("relative_goal", &AgentsInfo::relative_goal)
+        .def_readwrite("previous_actions", &AgentsInfo::previous_actions)
+        .def_readwrite("next_action", &AgentsInfo::next_action);
+
+    py::class_<Decoder>(m, "Decoder")
+        .def(py::init<const InputParameters &>())
+        .def("decode", &Decoder::decode);
+
     py::class_<ObservationGenerator>(m, "ObservationGenerator")
         .def(py::init<const std::vector<std::vector<int>> &, const InputParameters &>())
         .def("create_agents", &ObservationGenerator::create_agents)

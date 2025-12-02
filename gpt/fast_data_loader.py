@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pyarrow as pa
 import torch
-import random
+
 from loguru import logger
 from torch.utils.data import Dataset
 
@@ -17,79 +17,99 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         self.batch_size = batch_size
         self.dtype = torch.int8
 
-        ddp_local_rank = int(device.split(':')[-1])
+        ddp_local_rank = os.environ.get("LOCAL_RANK")
         ddp_world_size = os.environ.get("WORLD_SIZE")
-        random.shuffle(self.file_paths)
-        if "dagger" in folder_path or "ddg" in folder_path:
-            self.file_paths = sorted(self.file_paths,
-                                     key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split('_')[-1]),
-                                     reverse=True)
-        if "validation" not in folder_path and ddp_local_rank is not None and ddp_world_size is not None:
-            self.file_paths = self.file_paths[int(ddp_local_rank)::int(ddp_world_size)]
+        # Divide files among DDP workers for training
+
+        if not self.all_data_files:
+            raise FileNotFoundError(f"No '.arrow' files found in the provided path: '{folder_path}'")
+
+        if "train" in self.file_paths[0] and ddp_local_rank is not None and ddp_world_size is not None:
+            ddp_local_rank, ddp_world_size = int(ddp_local_rank), int(ddp_world_size)
+            files_per_worker = len(self.file_paths) // ddp_world_size
+            start_index = ddp_local_rank * files_per_worker
+            end_index = start_index + files_per_worker
+            self.file_paths = self.file_paths[start_index:end_index]
 
         # pre-allocate memory for the input and target tensors (same file size)
-        sample_input_tensors, sample_gt_actions = self._get_data_from_file(self.file_paths[0])
-        
-        # Determine action horizon dynamically from the loaded data
-        self.action_horizon = sample_gt_actions.shape[-1] if sample_gt_actions.ndim > 1 else 1
-
+        sample_input_tensors, sample_target_tensors, sample_agents_in_obs = self._get_data_from_file(self.file_paths[0])
         self.input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
-        self.target_tensors = torch.full(
-            sample_input_tensors.shape + (self.action_horizon,),
-            -1,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        self.target_tensors = torch.full(sample_target_tensors.shape, -1, dtype=self.dtype, device=self.device)
+        self.agents_in_obs = torch.empty(sample_agents_in_obs.shape, dtype=self.dtype, device=self.device)
 
         logger.info(
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
-        logger.info(f"Detected action horizon: {self.action_horizon}")
 
     @staticmethod
-    def _get_data_from_file(file_path):
+    def _get_data_from_file(file_path, shuffle_data=True):
         with pa.memory_map(file_path) as source:
             table = pa.ipc.open_file(source).read_all()
-            input_tensors = table["input_tensors"].to_numpy()
-            gt_actions = table["gt_actions"].to_numpy()
+            input_tensors_raw = table["input_tensors"].to_numpy(zero_copy_only=False)
+            gt_actions_raw = table["gt_actions"].to_numpy(zero_copy_only=False)
+            agents_in_obs_raw = table["agents_in_obs"].to_numpy(zero_copy_only=False)
 
-        # Flatten the data: convert from List[timestep][agent][...] to List[agent_obs][...]
-        flattened_inputs = []
-        flattened_actions = []
-        
-        for t in range(len(input_tensors)):
-            for agent_idx in range(len(input_tensors[t])):
-                flattened_inputs.append(input_tensors[t][agent_idx])
-                flattened_actions.append(gt_actions[t][agent_idx])
+        # input_tensors: List[t][agent][256] -> np.array[t, agent, 256]
+        input_tensors = np.array(
+            [[np.array(inner, dtype=np.int8) for inner in batch] for batch in input_tensors_raw],
+            dtype=np.int8,
+        )
 
-        # Convert to numpy arrays
-        flattened_inputs = np.array(flattened_inputs)
-        flattened_actions = np.array(flattened_actions)
+        # gt_actions: List[timestep][agent][10] -> full action horizon per agent
+        # Result shape: [num_timesteps, num_agents, horizon]
+        gt_actions = np.array(
+            [
+                [np.array(agent_actions, dtype=np.int8) for agent_actions in actions_at_t]
+                for actions_at_t in gt_actions_raw
+            ],
+            dtype=np.int8,
+        )
+
+        # agents_in_obs_raw: List[t][agent][int8] (variable length neighbor lists)
+        # We need a dense tensor: [t, agent, max_num_neighbors], padded with -1.
+        num_timesteps = len(agents_in_obs_raw)
+        num_agents = len(agents_in_obs_raw[0]) if num_timesteps > 0 else 0
+
+        # Compute max number of neighbors across the file
+        max_num_neighbors = 0
+        for obs in agents_in_obs_raw:
+            for o in obs:
+                if len(o) > max_num_neighbors:
+                    max_num_neighbors = len(o)
+
+        if max_num_neighbors == 0:
+            # No neighbors at all in this file; create an empty placeholder dimension of size 1
+            max_num_neighbors = 1
+
+        agents_in_obs = np.full(
+            (num_timesteps, num_agents, max_num_neighbors),
+            fill_value=-1,
+            dtype=np.int8,
+        )
+
+        for t, obs in enumerate(agents_in_obs_raw):
+            for a, o in enumerate(obs):
+                length = min(len(o), max_num_neighbors)
+                if length > 0:
+                    agents_in_obs[t, a, :length] = np.array(o[:length], dtype=np.int8)
 
         # shuffle data within the current file
-        indices = np.random.permutation(len(flattened_inputs))
-        flattened_inputs = flattened_inputs[indices]
-        flattened_actions = flattened_actions[indices]
+        if shuffle_data:
+            indices = np.random.permutation(len(input_tensors))
+            input_tensors = input_tensors[indices]
+            gt_actions = gt_actions[indices]
+            agents_in_obs = agents_in_obs[indices]
 
-        return flattened_inputs, flattened_actions
+        return input_tensors, gt_actions, agents_in_obs
 
     def load_and_transfer_data_file(self, filename):
         start_time = time.monotonic()
 
-        input_tensors, gt_actions = self._get_data_from_file(filename)
+        input_tensors, gt_actions, agents_in_obs = self._get_data_from_file(filename)
 
         self.input_tensors.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
-        gt_actions_tensor = torch.tensor(gt_actions, dtype=self.dtype)
-        
-        # Ensure gt_actions has the correct shape for action_horizon
-        if gt_actions_tensor.ndim == 1:
-            gt_actions_tensor = gt_actions_tensor.unsqueeze(-1)
-        if gt_actions_tensor.size(-1) != self.action_horizon:
-            raise ValueError(
-                f"Expected gt_actions last dimension to be {self.action_horizon}, got {gt_actions_tensor.size(-1)}"
-            )
-        
-        # Copy the action tensor to the target tensor
-        self.target_tensors.copy_(gt_actions_tensor, non_blocking=True)
+        self.target_tensors.copy_(torch.tensor(gt_actions, dtype=self.dtype), non_blocking=True)
+        self.agents_in_obs.copy_(torch.tensor(agents_in_obs, dtype=self.dtype), non_blocking=True)
+
         finish_time = time.monotonic() - start_time
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
 
@@ -97,11 +117,10 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         while True:
             for file_path in self.file_paths:
                 self.load_and_transfer_data_file(file_path)
-                num_samples = len(self.input_tensors)
-                if num_samples < self.batch_size:
-                    raise KeyError('The dataset is too small to sample a single batch.')
-                for i in range(0, num_samples - num_samples % self.batch_size, self.batch_size):
-                    yield self.input_tensors[i:i + self.batch_size], self.target_tensors[i:i + self.batch_size]
+                for i in range(0, len(self.input_tensors), self.batch_size):
+                    yield self.input_tensors[i:i + self.batch_size], self.target_tensors[
+                                                                     i:i + self.batch_size], self.agents_in_obs[
+                                                                                             i:i + self.batch_size]
 
     def get_shard_size(self):
         return len(self.input_tensors) * len(self.file_paths)
@@ -111,9 +130,8 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
 
 def main():
-    # folder_path = "../dataset/validation"
-    folder_path = "../dataset/train"
-    dataset = MapfArrowDataset(folder_path, device='cuda:0', batch_size=3 * 256)
+    folder_path = "../dataset/train/mazes"
+    dataset = MapfArrowDataset(folder_path, device='cuda:0', batch_size=32)
     data = iter(dataset)
     x = 0
     logger.info(dataset.get_full_dataset_size())
@@ -121,8 +139,12 @@ def main():
 
     while True:
         x += 1
-        qx, qy = next(data)
-        logger.info(str(qx.shape) + ' ' + str(qy.shape))
+        observations, actions, agent_chat_ids = next(data)
+        logger.info(str(observations.shape) + ' ' + str(actions.shape) + ' ' + str(agent_chat_ids.shape))
+        logger.info('Tokenized observation example:' + str(observations[0][0]))
+        logger.info('Action:' +str(actions[0][0]))
+        logger.info('Chat ids:' + str(agent_chat_ids[0][0]))
+        exit(0)
 
 
 if __name__ == "__main__":

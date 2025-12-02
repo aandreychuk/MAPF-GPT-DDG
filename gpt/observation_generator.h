@@ -13,6 +13,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <deque>
 #define PYBIND11_MODULE
 #ifdef PYBIND11_MODULE
 #include <pybind11/pybind11.h>
@@ -74,6 +75,25 @@ public:
     std::unordered_map<int, std::string> inverse_str_vocab;
     Encoder(const InputParameters &cfg);
     std::vector<int> encode(const std::vector<AgentsInfo> &agents, const std::vector<std::vector<int>> &cost2go);
+};
+
+class Decoder
+{
+public:
+    InputParameters cfg;
+    std::vector<int> coord_range;
+    std::vector<char> actions_range;
+    std::vector<std::string> next_action_range;
+    std::unordered_map<std::string, int> str_vocab;
+    std::unordered_map<int, int> int_vocab;
+    std::unordered_map<int, int> inverse_int_vocab;
+    std::unordered_map<int, std::string> inverse_str_vocab;
+
+    Decoder(const InputParameters &cfg);
+
+    // Returns pair: (cost2go matrix, agents info list)
+    std::pair<std::vector<std::vector<int>>, std::vector<AgentsInfo>>
+    decode(const std::vector<int> &encoded) const;
 };
 
 class ObservationGenerator
