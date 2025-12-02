@@ -28,8 +28,8 @@ void ObservationGenerator::compute_cost2go_for_goal(const std::pair<int, int> &g
                     cost_matrix[new_i][new_j] = cost_matrix[pos.first][pos.second] + 1;
                     fringe.push(std::make_pair(new_i, new_j));
                 }
+            }
         }
-    }
     }
     
     // Convert distance matrix to directional flags
@@ -127,10 +127,20 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
             }
         }
     }
-    auto &inner = agents_in_observation[agent_idx];
-    std::sort(inner.begin(), inner.end(), [&](int lhs, int rhs) {
-        return agents_in_observation_distances[lhs] < agents_in_observation_distances[rhs];
-    });
+    // Create pairs of (agent_id, distance) and sort by distance
+    std::vector<std::pair<int, int>> agent_distance_pairs;
+    for (size_t idx = 0; idx < agents_in_observation[agent_idx].size(); idx++) {
+        agent_distance_pairs.push_back({agents_in_observation[agent_idx][idx], agents_in_observation_distances[idx]});
+    }
+    std::sort(agent_distance_pairs.begin(), agent_distance_pairs.end(), 
+        [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
+            return a.second < b.second;
+        });
+    // Extract sorted agent IDs
+    agents_in_observation[agent_idx].clear();
+    for (const auto &pair : agent_distance_pairs) {
+        agents_in_observation[agent_idx].push_back(pair.first);
+    }
 }
 
 void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals)
