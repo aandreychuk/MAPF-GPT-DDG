@@ -41,7 +41,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
 
     @staticmethod
-    def _get_data_from_file(file_path, shuffle_data=True):
+    def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13):
         with pa.memory_map(file_path) as source:
             table = pa.ipc.open_file(source).read_all()
             input_tensors_raw = table["input_tensors"].to_numpy(zero_copy_only=False)
@@ -68,17 +68,6 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         # We need a dense tensor: [t, agent, max_num_neighbors], padded with -1.
         num_timesteps = len(agents_in_obs_raw)
         num_agents = len(agents_in_obs_raw[0]) if num_timesteps > 0 else 0
-
-        # Compute max number of neighbors across the file
-        max_num_neighbors = 0
-        for obs in agents_in_obs_raw:
-            for o in obs:
-                if len(o) > max_num_neighbors:
-                    max_num_neighbors = len(o)
-
-        if max_num_neighbors == 0:
-            # No neighbors at all in this file; create an empty placeholder dimension of size 1
-            max_num_neighbors = 1
 
         agents_in_obs = np.full(
             (num_timesteps, num_agents, max_num_neighbors),
