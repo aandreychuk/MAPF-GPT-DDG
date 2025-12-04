@@ -323,19 +323,30 @@ class RepresentationEncoder(nn.Module):
         attn_bias = attn_bias.masked_fill(empty_mask_idx[:, None, None, :], float('-inf'))
 
         #create neighbor embeddings (includes agent itself as a neighbor)
-        nbrs = torch.arange(self.max_num_neighbors, device=device, dtype=torch.long)
-        nbrs = self.transformer.wne(nbrs.repeat_interleave(self.agent_info_size))
-        tail_size = self.block_size - self.field_of_view_size - self.max_num_neighbors*self.agent_info_size
-        nbrs_embd = torch.cat(
-            [
-                torch.zeros(self.field_of_view_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype),
-                nbrs,
-                torch.zeros(tail_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype)
-            ],
-            dim = 0
-        )
+        if self.agent_info_size == 0:
+            # Directions observation: no explicit neighbor-info segment.
+            # Just create a zero bias of the same length as the sequence.
+            nbrs_embd = torch.zeros(t, self.transformer.wte.weight.size(1),
+                                    device=device, dtype=self.transformer.wte.weight.dtype)
+        else:
+            nbrs = torch.arange(self.max_num_neighbors, device=device, dtype=torch.long)
+            nbrs = self.transformer.wne(nbrs.repeat_interleave(self.agent_info_size))
+            # Use actual sequence length t so nbrs_embd matches tok_emb/pos_emb along time
+            tail_size = t - self.field_of_view_size - self.max_num_neighbors * self.agent_info_size
+            assert tail_size >= 0, (
+                f"Sequence length {t} is too small. "
+                f"Need at least {self.field_of_view_size + self.max_num_neighbors * self.agent_info_size} tokens, "
+                f"but got {t}"
+            )
+            nbrs_embd = torch.cat(
+                [
+                    torch.zeros(self.field_of_view_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype),
+                    nbrs,
+                    torch.zeros(tail_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype),
+                ],
+                dim=0,
+            )
 
-        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
