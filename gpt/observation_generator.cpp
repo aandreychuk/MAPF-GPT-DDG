@@ -448,11 +448,11 @@ std::vector<AgentsInfo> ObservationGenerator::get_agents_info(int agent_idx)
         distance_agent_pairs.push_back({distances[i], considered_agents[i]});
     }
     std::sort(distance_agent_pairs.begin(), distance_agent_pairs.end());
-    agents_in_observation[agent_idx].clear();
+    agents_in_observation[agent_idx] = std::vector<int>(13,-1);
     for (int i = 0; i < std::min(int(distance_agent_pairs.size()), cfg.num_agents); i++)
     {
         const auto &agent = agents[distance_agent_pairs[i].second];
-        agents_in_observation[agent_idx].push_back(distance_agent_pairs[i].second);
+        agents_in_observation[agent_idx][i] = distance_agent_pairs[i].second;
         agents_info.push_back(AgentsInfo(std::make_pair(agent.pos.first - cur_agent.pos.first, agent.pos.second - cur_agent.pos.second),
                                          std::make_pair(agent.goal.first - cur_agent.pos.first, agent.goal.second - cur_agent.pos.second),
                                          agent.action_history, agent.next_action));
@@ -519,7 +519,7 @@ PYBIND11_MODULE(observation_generator, m)
         .def(py::init<const InputParameters &>())
         .def("decode", &Decoder::decode);
 
-    py::class_<ObservationGenerator>(m, "ObservationGenerator")
+    py::class_<ObservationGenerator>(m, "ObservationGenerator", py::module_local())
         .def(py::init<const std::vector<std::vector<int>> &, const InputParameters &>())
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)

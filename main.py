@@ -86,6 +86,12 @@ dtype = (
 compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 
+current_train_index = 0
+current_valid_index = 0
+
+train_data_files = ['dataset/mazes', 'dataset/random']
+batch_sizes = [36, 4]
+
 config_keys = [
     k
     for k, v in globals().items()
@@ -93,11 +99,6 @@ config_keys = [
 ]
 exec(open("gpt/configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
-current_train_index = 0
-current_valid_index = 0
-
-train_data_files = ['dataset/mazes', 'dataset/random']
-batch_sizes = [4, 1]
 
 train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
 

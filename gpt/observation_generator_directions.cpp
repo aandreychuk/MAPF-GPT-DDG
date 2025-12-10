@@ -140,7 +140,11 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
     agents_in_observation[agent_idx].clear();
     for (const auto &pair : agent_distance_pairs) {
         agents_in_observation[agent_idx].push_back(pair.first);
+        if(agents_in_observation[agent_idx].size() == 13) break;
     }
+    while(agents_in_observation[agent_idx].size() < 13)
+        agents_in_observation[agent_idx].push_back(-1);
+
 }
 
 void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals)
@@ -573,7 +577,7 @@ int main()
 namespace py = pybind11;
 PYBIND11_MODULE(observation_generator_directions, m)
 {
-    py::class_<ObservationGenerator>(m, "ObservationGenerator")
+    py::class_<ObservationGenerator>(m, "ObservationGeneratorDirections", py::module_local())
         .def(py::init<const std::vector<std::vector<int>> &, int, int>())
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)
