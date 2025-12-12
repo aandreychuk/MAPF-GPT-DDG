@@ -51,7 +51,6 @@ empty_connection_code = -1
 n_comm_rounds = 2
 
 field_of_view_size = 11*11
-agent_info_size = 10
 max_num_neighbors = 13
 
 dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
@@ -195,12 +194,15 @@ empty_token_code = 66
 meta_vocab_size = 67
 
 def get_batch(data):
-    observations, actions, agent_chat_ids = next(data)
-    # observations = observations.reshape(-1, observations.size(-1))
-    # actions = actions.reshape(-1)
-    # agent_chat_ids = agent_chat_ids.reshape(-1, agent_chat_ids.size(-1))
-
-    return observations.to(torch.int), agent_chat_ids.to(torch.int), actions.to(torch.long)
+    observations, actions, agent_chat_ids, agents_rel_coords = next(data)
+    # observations: [B, agents, seq_len] - FOV observations
+    # actions: [B, agents, horizon] - target actions
+    # agent_chat_ids: [B, agents, max_neighbors] - agent IDs for message routing
+    # agents_rel_coords: [B, agents, max_neighbors*2] - relative coordinates (dx,dy pairs)
+    return (observations.to(torch.int), 
+            agent_chat_ids.to(torch.int), 
+            actions.to(torch.long),
+            agents_rel_coords.to(torch.long))
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -223,7 +225,6 @@ model_args = dict(
     latent_embd = latent_embd,
     latent_tok_n = latent_tok_n,
     field_of_view_size = field_of_view_size,
-    agent_info_size = agent_info_size,
     max_num_neighbors = max_num_neighbors,
     empty_token_code = empty_token_code,
     num_action_heads = num_action_heads,
@@ -247,10 +248,11 @@ elif init_from == "resume":
     for k in ["n_encoder_layer", "n_decoder_layer",
         "action_msg_feats", "empty_connection_code", "n_comm_rounds",
         "latent_embd", "latent_tok_n", "field_of_view_size",
-        "agent_info_size", "max_num_neighbors", "empty_token_code",
+        "max_num_neighbors", "empty_token_code",
         "n_head", "n_embd", "block_size", "bias",
         "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = DMMConfig(**model_args)
     model = DMM(gptconf)
@@ -291,7 +293,7 @@ if compile and 'cuda' in device:
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -304,11 +306,12 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             if split == "train":
-                X, Y, Z = get_batch(train_data_iter)
+                obs, agent_ids, actions, rel_coords = get_batch(train_data_iter)
             else:
                 raise KeyError
             with ctx:
-                logits, loss = model(X, Y, Z)
+                # DMM forward: (observations, agent_chat_ids, target_actions, agents_rel_coords)
+                logits, loss = model(obs, agent_ids, actions, rel_coords)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -332,7 +335,7 @@ def get_lr(it):
 
 
 # training loop
-X, Y, Z = get_batch(train_data_iter)  # fetch the very first batch
+obs, agent_ids, actions, rel_coords = get_batch(train_data_iter)  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -380,14 +383,13 @@ while True:
                     micro_step == gradient_accumulation_steps - 1
             )
         with ctx:
-            logits, loss = model(X, Y, Z)
-          #  import pdb REMOVE
-          #  pdb.set_trace()
+            # DMM forward: (observations, agent_chat_ids, target_actions, agents_rel_coords)
+            logits, loss = model(obs, agent_ids, actions, rel_coords)
             loss = (
                     loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, Z = get_batch(train_data_iter)
+        obs, agent_ids, actions, rel_coords = get_batch(train_data_iter)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

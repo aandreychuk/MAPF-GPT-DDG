@@ -33,8 +33,11 @@ class AggregatedMapfArrowDataset(Dataset):
         dataset_iters = [iter(dataset) for dataset in self.datasets]
 
         while True:
-            batch_inputs, batch_targets, batch_agents = zip(*[next(dataset_iter) for dataset_iter in dataset_iters])
-            yield torch.cat(batch_inputs, dim=0), torch.cat(batch_targets, dim=0), torch.cat(batch_agents, dim=0)
+            batch_inputs, batch_targets, batch_agents, batch_rel_coords = zip(*[next(dataset_iter) for dataset_iter in dataset_iters])
+            yield (torch.cat(batch_inputs, dim=0), 
+                   torch.cat(batch_targets, dim=0), 
+                   torch.cat(batch_agents, dim=0),
+                   torch.cat(batch_rel_coords, dim=0))
 
     def get_full_dataset_size(self):
         return sum(dataset.get_full_dataset_size() for dataset in self.datasets)
@@ -55,12 +58,12 @@ def main():
     x = 0
     while True:
         x += 1
-        observations, actions, agent_chat_ids = next(data)
-        # logger.info(str(qx.shape) + ' ' + str(qy.shape) + ' ' + str(qz.shape))
-        logger.info(str(observations.shape) + ' ' + str(actions.shape) + ' ' + str(agent_chat_ids.shape))
+        observations, actions, agent_chat_ids, agents_rel_coords = next(data)
+        logger.info(str(observations.shape) + ' ' + str(actions.shape) + ' ' + str(agent_chat_ids.shape) + ' ' + str(agents_rel_coords.shape))
         logger.info('Tokenized observation example:' + str(observations[0][0]))
-        logger.info('Action:' +str(actions[0][0]))
+        logger.info('Action:' + str(actions[0][0]))
         logger.info('Chat ids:' + str(agent_chat_ids[0][0]))
+        logger.info('Rel coords:' + str(agents_rel_coords[0][0]))
         exit(0)
 
 if __name__ == "__main__":

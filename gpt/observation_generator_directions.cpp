@@ -88,14 +88,23 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
     // 0:     Obstacle/out of bounds
     // 1-16:  Direction to goal (no agent present)
     // 17-96: Agent present with combined action info
+    
+    constexpr int MAX_NEIGHBORS = 13;
+    
     const auto &agent = agents[agent_idx];
     const auto &goal = agent.goal;
     const auto &pos = agent.pos;
     
-    agents_in_observation[agent_idx].clear();
-    std::vector<int> agents_in_observation_distances;
+    // Neighbor info: agent_id, distance, dx, dy
+    struct NeighborInfo {
+        int agent_id;
+        int distance;
+        int dx, dy;
+    };
+    std::vector<NeighborInfo> neighbors;
+    neighbors.reserve(MAX_NEIGHBORS * 2);  // usually won't have more than this
     
-    // Fill the observation buffer with unified encoding
+    // Fill the observation buffer and collect neighbor info
     for (int i = 0; i <= obs_radius * 2; i++)
     {
         for (int j = 0; j <= obs_radius * 2; j++)
@@ -110,41 +119,44 @@ void ObservationGenerator::generate_cost2go_obs(int agent_idx, std::vector<std::
             }
             else
             {
-                // Check if there's an agent at this position
                 int agent_at_pos = agents_locations[grid_i][grid_j];
                 if (agent_at_pos >= 0)
                 {
                     // Agent present - encode agent information
                     buffer[i][j] = 16 + agents[agent_at_pos].last_action * 16 + agents[agent_at_pos].next_action;
-                    agents_in_observation[agent_idx].push_back(agent_at_pos);
-                    agents_in_observation_distances.push_back(abs(i - obs_radius) + abs(j - obs_radius));
+                    neighbors.push_back({
+                        agent_at_pos,
+                        abs(i - obs_radius) + abs(j - obs_radius),  // Manhattan distance
+                        j - obs_radius,  // dx: negative=left, positive=right
+                        i - obs_radius   // dy: negative=up, positive=down
+                    });
                 }
                 else
                 {
-                    // No agent - use directional value
                     buffer[i][j] = cost2go_cache[goal][grid_i][grid_j];
                 }
             }
         }
     }
-    // Create pairs of (agent_id, distance) and sort by distance
-    std::vector<std::pair<int, int>> agent_distance_pairs;
-    for (size_t idx = 0; idx < agents_in_observation[agent_idx].size(); idx++) {
-        agent_distance_pairs.push_back({agents_in_observation[agent_idx][idx], agents_in_observation_distances[idx]});
+    
+    // Sort by distance, keep closest MAX_NEIGHBORS
+    size_t keep_count = std::min(neighbors.size(), static_cast<size_t>(MAX_NEIGHBORS));
+    std::partial_sort(neighbors.begin(), neighbors.begin() + keep_count, neighbors.end(),
+        [](const NeighborInfo &a, const NeighborInfo &b) { return a.distance < b.distance; });
+    
+    // Store results with padding for empty slots
+    const int NO_NEIGHBOR = obs_radius + 1;  // outside valid range [-obs_radius, obs_radius]
+    
+    auto &agent_ids = agents_in_observation[agent_idx];
+    auto &rel_coords = agents_rel_coords[agent_idx];
+    agent_ids.assign(MAX_NEIGHBORS, -1);
+    rel_coords.assign(MAX_NEIGHBORS * 2, NO_NEIGHBOR);
+    
+    for (size_t i = 0; i < keep_count; ++i) {
+        agent_ids[i] = neighbors[i].agent_id;
+        rel_coords[i * 2] = neighbors[i].dx;
+        rel_coords[i * 2 + 1] = neighbors[i].dy;
     }
-    std::sort(agent_distance_pairs.begin(), agent_distance_pairs.end(), 
-        [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
-            return a.second < b.second;
-        });
-    // Extract sorted agent IDs
-    agents_in_observation[agent_idx].clear();
-    for (const auto &pair : agent_distance_pairs) {
-        agents_in_observation[agent_idx].push_back(pair.first);
-        if(agents_in_observation[agent_idx].size() == 13) break;
-    }
-    while(agents_in_observation[agent_idx].size() < 13)
-        agents_in_observation[agent_idx].push_back(-1);
-
 }
 
 void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> &positions, const std::vector<std::pair<int, int>> &goals)
@@ -154,6 +166,7 @@ void ObservationGenerator::create_agents(const std::vector<std::pair<int, int>> 
     agents.resize(total_agents);
     obs_buffer.resize(total_agents, std::vector<std::vector<int>>(2 * obs_radius + 1, std::vector<int>(2 * obs_radius + 1)));
     agents_in_observation.resize(total_agents);
+    agents_rel_coords.resize(total_agents);
     
     for (int i = 0; i < total_agents; i++)
     {
@@ -215,6 +228,7 @@ void ObservationGenerator::update_agents(const std::vector<std::pair<int, int>> 
 std::vector<std::vector<int>> ObservationGenerator::generate_observations()
 {
     std::vector<std::vector<int>> observations(agents.size(), std::vector<int>(context_size, 0));
+    
     for (size_t i = 0; i < agents.size(); i++)
     {
         generate_cost2go_obs(i, obs_buffer[i]);
@@ -223,8 +237,18 @@ std::vector<std::vector<int>> ObservationGenerator::generate_observations()
         for (const auto &row : obs_buffer[i])
             for (int value : row)
                 observations[i][idx++] = value;
+        // Note: agents_fov_positions is populated but NOT appended to observation.
+        // It's accessed separately via get_agents_fov_positions() and passed to the model.
     }
     return observations;
+}
+
+std::vector<std::vector<int>> ObservationGenerator::get_agents_relative_coords()
+{
+    // Returns relative coordinates for each agent's neighbors
+    // Format: [agent_idx][neighbor_idx * 2 + 0/1] = dx/dy
+    // Values in range [-obs_radius, obs_radius], or obs_radius+1 for "no neighbor"
+    return agents_rel_coords;
 }
 
 
@@ -582,7 +606,8 @@ PYBIND11_MODULE(observation_generator_directions, m)
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)
         .def("generate_observations", &ObservationGenerator::generate_observations)
-        .def("get_agents_ids_in_observations", &ObservationGenerator::get_agents_ids_in_observations);
+        .def("get_agents_ids_in_observations", &ObservationGenerator::get_agents_ids_in_observations)
+        .def("get_agents_relative_coords", &ObservationGenerator::get_agents_relative_coords);
 }
 /*
 <%

@@ -14,20 +14,23 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-def save_to_arrow(inputs, gt_actions, agents_in_obs, filepath):
+def save_to_arrow(inputs, gt_actions, agents_in_obs, agents_rel_coords, filepath):
     # inputs: List[timestep][agent][int8] - [int8] is observation
     # gt_actions: List[timestep][agent][int8] - [int8] is list of actions (length 10)
     # agents_in_obs: List[timestep][agent][int8] - [int8] is list of agents in observation (variable length)
+    # agents_rel_coords: List[timestep][agent][int8] - [int8] is list of relative coordinates (dx0,dy0,dx1,dy1,...)
     schema = pa.schema([
         ('input_tensors', pa.list_(pa.list_(pa.int8()))),
         ('gt_actions', pa.list_(pa.list_(pa.int8()))),
-        ('agents_in_obs', pa.list_(pa.list_(pa.int8())))
+        ('agents_in_obs', pa.list_(pa.list_(pa.int8()))),
+        ('agents_rel_coords', pa.list_(pa.list_(pa.int8())))
     ])
 
     input_tensors_col = pa.array(inputs, type=pa.list_(pa.list_(pa.int8())))
     gt_actions_col = pa.array(gt_actions, type=pa.list_(pa.list_(pa.int8())))
     agents_in_obs_col = pa.array(agents_in_obs, type=pa.list_(pa.list_(pa.int8())))
-    table = pa.Table.from_arrays([input_tensors_col, gt_actions_col, agents_in_obs_col], schema=schema)
+    agents_rel_coords_col = pa.array(agents_rel_coords, type=pa.list_(pa.list_(pa.int8())))
+    table = pa.Table.from_arrays([input_tensors_col, gt_actions_col, agents_in_obs_col, agents_rel_coords_col], schema=schema)
 
     if not os.path.exists(os.path.dirname(filepath)):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -35,16 +38,18 @@ def save_to_arrow(inputs, gt_actions, agents_in_obs, filepath):
         with ipc.new_file(f, schema) as writer:
             writer.write(table)
 
-def filter_and_balance_timesteps(timestep_observations, timestep_actions, timestep_agents_in_obs, target_ratio=0.2):
+def filter_and_balance_timesteps(timestep_observations, timestep_actions, timestep_agents_in_obs, timestep_rel_coords, target_ratio=0.2):
     """
     Filter timesteps to reduce over-representation of zero actions.
     Only considers the first action (a0) in each tuple for balancing.
 
     - timestep_observations: List[timestep][agent][int8]
     - timestep_actions: List[timestep][agent][int8] where per-agent action is a horizon tuple (length 10)
+    - timestep_agents_in_obs: List[timestep][agent][int8] - agent IDs in observation
+    - timestep_rel_coords: List[timestep][agent][int8] - relative coordinates (dx,dy) pairs
     """
     if len(timestep_actions) == 0:
-        return timestep_observations, timestep_actions
+        return timestep_observations, timestep_actions, timestep_agents_in_obs, timestep_rel_coords
 
     # Compute totals and per-timestep zero counts (only considering first action a0)
     total_actions = 0
@@ -64,10 +69,10 @@ def filter_and_balance_timesteps(timestep_observations, timestep_actions, timest
         per_timestep_stats.append((t_idx, zeros_in_t, total_in_t))
 
     if total_actions == 0:
-        return timestep_observations, timestep_actions
+        return timestep_observations, timestep_actions, timestep_agents_in_obs, timestep_rel_coords
 
     if total_zero_actions <= target_ratio * total_actions:
-        return timestep_observations, timestep_actions
+        return timestep_observations, timestep_actions, timestep_agents_in_obs, timestep_rel_coords
 
     # Sort timesteps by zero count descending; remove greedily until balanced
     removable = sorted(per_timestep_stats, key=lambda x: x[1], reverse=True)
@@ -87,8 +92,9 @@ def filter_and_balance_timesteps(timestep_observations, timestep_actions, timest
     filtered_obs = [timestep_observations[i] for i in range(len(timestep_observations)) if keep_mask[i]]
     filtered_actions = [timestep_actions[i] for i in range(len(timestep_actions)) if keep_mask[i]]
     filtered_agents_in_obs = [timestep_agents_in_obs[i] for i in range(len(timestep_agents_in_obs)) if keep_mask[i]]
+    filtered_rel_coords = [timestep_rel_coords[i] for i in range(len(timestep_rel_coords)) if keep_mask[i]]
 
-    return filtered_obs, filtered_actions, filtered_agents_in_obs
+    return filtered_obs, filtered_actions, filtered_agents_in_obs, filtered_rel_coords
 
 def get_data_from_file(file_path):
     with pa.memory_map(file_path) as source:
@@ -103,8 +109,8 @@ def get_data_from_file(file_path):
 def generate_observations(gt_actions, grid, starts, targets, observation_type='cost2go'):
     if observation_type == 'directions':
         from cppimport import import_hook
-        from gpt.observation_generator_directions import ObservationGenerator
-        observation_generator = ObservationGenerator(grid, 5, 128)
+        from gpt.observation_generator_directions import ObservationGeneratorDirections
+        observation_generator = ObservationGeneratorDirections(grid, 5, 128)
     else:
         from cppimport import import_hook
         from gpt.observation_generator import ObservationGenerator, InputParameters
@@ -113,9 +119,10 @@ def generate_observations(gt_actions, grid, starts, targets, observation_type='c
     observation_generator.create_agents(starts, targets)
     observation_generator.update_agents(starts, targets, [-1 for _ in range(len(starts))])
     # Accumulate per-timestep lists
-    observations = []  # List[t][agent][...]
-    actions = []       # List[t][agent][a0,a1,a2,...,a9] (10 actions)
-    agents_in_obs = [] # List[t][agent][int8] - [int8] is list of agents in observation (variable length)
+    observations = []     # List[t][agent][...]
+    actions = []          # List[t][agent][a0,a1,a2,...,a9] (10 actions)
+    agents_in_obs = []    # List[t][agent][int8] - agent IDs in observation
+    agents_rel_coords = []  # List[t][agent][int8] - relative coordinates (dx0,dy0,dx1,dy1,...)
     positions = starts
     moves = GridConfig().MOVES
     for i in range(len(gt_actions)):
@@ -134,34 +141,49 @@ def generate_observations(gt_actions, grid, starts, targets, observation_type='c
             timestep_actions.append(action_tuple)
         actions.append(timestep_actions)
         agents_in_obs.append(observation_generator.get_agents_ids_in_observations())
+        # Get relative coordinates (only available for directions observation)
+        if observation_type == 'directions':
+            agents_rel_coords.append(observation_generator.get_agents_relative_coords())
+        else:
+            # For cost2go, create empty placeholder (26 zeros per agent = 13 neighbors * 2 coords)
+            agents_rel_coords.append([[0] * 26 for _ in range(num_agents)])
         positions = [[positions[j][0] + moves[gt_actions[i][j]][0], positions[j][1] + moves[gt_actions[i][j]][1]] for j in range(len(positions))]
         observation_generator.update_agents(positions, targets, gt_actions[i])
-    return observations, actions, agents_in_obs
+    return observations, actions, agents_in_obs, agents_rel_coords
 
 def run_worker(files, log_path, dataset_path, samples_per_file, worker_id, observation_type='cost2go'):
     # Buffers hold timesteps
-    all_observations = []  # List[t][agent][...]
-    all_actions = []       # List[t][agent][a0,a1,a2,...,a9] (10 actions)
-    all_agents_in_obs = [] # List[t][agent][int8] - [int8] is list of agents in observation (variable length)
+    all_observations = []     # List[t][agent][...]
+    all_actions = []          # List[t][agent][a0,a1,a2,...,a9] (10 actions)
+    all_agents_in_obs = []    # List[t][agent][int8] - agent IDs in observation
+    all_agents_rel_coords = []  # List[t][agent][int8] - relative coordinates
     part_id = 0
     for file in files:
         file_path = os.path.join(log_path, file)
         gt_actions, grid, starts, targets, seeds = get_data_from_file(file_path)
         for i in range(len(gt_actions)):
-            observations, actions, agents_in_obs = generate_observations(gt_actions[i], grid[i], starts[i], targets[i], observation_type)
+            observations, actions, agents_in_obs, agents_rel_coords = generate_observations(gt_actions[i], grid[i], starts[i], targets[i], observation_type)
             # Append raw timesteps first; filter later when buffer big enough
             all_observations.extend(observations)
             all_actions.extend(actions)
             all_agents_in_obs.extend(agents_in_obs)
+            all_agents_rel_coords.extend(agents_rel_coords)
             # Trigger filtering when buffer exceeds 2x samples_per_file timesteps
             if len(all_observations) >= 2 * samples_per_file:
-                all_observations, all_actions, all_agents_in_obs = filter_and_balance_timesteps(all_observations, all_actions, all_agents_in_obs)
+                all_observations, all_actions, all_agents_in_obs, all_agents_rel_coords = filter_and_balance_timesteps(
+                    all_observations, all_actions, all_agents_in_obs, all_agents_rel_coords)
                 # Save when enough timesteps available
                 if len(all_observations) >= samples_per_file:
-                    save_to_arrow(all_observations[:samples_per_file], all_actions[:samples_per_file], all_agents_in_obs[:samples_per_file], os.path.join(dataset_path, f"part_{worker_id}_{part_id}.arrow"))
+                    save_to_arrow(
+                        all_observations[:samples_per_file], 
+                        all_actions[:samples_per_file], 
+                        all_agents_in_obs[:samples_per_file],
+                        all_agents_rel_coords[:samples_per_file],
+                        os.path.join(dataset_path, f"part_{worker_id}_{part_id}.arrow"))
                     all_observations = all_observations[samples_per_file:]
                     all_actions = all_actions[samples_per_file:]
                     all_agents_in_obs = all_agents_in_obs[samples_per_file:]
+                    all_agents_rel_coords = all_agents_rel_coords[samples_per_file:]
                     part_id += 1
         print(f"{file} processed")
 

@@ -233,10 +233,9 @@ class Block(nn.Module):
 
 @dataclass
 class DMMConfig:
-    block_size: int = 256
-    vocab_size: int = 67
+    block_size: int = 128
+    vocab_size: int = 97  # Directions observation: 0-96
     field_of_view_size: int = 11*11
-    agent_info_size: int = 10
     max_num_neighbors: int = 13
 
     n_encoder_layer: int = 2 #
@@ -272,7 +271,6 @@ class RepresentationEncoder(nn.Module):
         self.latent_tok_n = config.latent_tok_n
 
         self.max_num_neighbors = config.max_num_neighbors
-        self.agent_info_size = config.agent_info_size
         self.field_of_view_size = config.field_of_view_size
         self.block_size = config.block_size
 
@@ -280,8 +278,6 @@ class RepresentationEncoder(nn.Module):
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             wle=nn.Embedding(config.latent_tok_n, config.latent_embd),
-            wne=nn.Embedding(config.max_num_neighbors, config.n_embd), # neighbor embeddings
-            #NEW several CLS toks as learnable tokens to form encoded representation
             drop=nn.Dropout(config.dropout),
             h=nn.ModuleList(
                 [Block(config, config.n_embd) for _ in range(config.n_encoder_layer)]
@@ -322,30 +318,8 @@ class RepresentationEncoder(nn.Module):
         attn_bias = torch.zeros(b, self.n_head, t, t, device=device)
         attn_bias = attn_bias.masked_fill(empty_mask_idx[:, None, None, :], float('-inf'))
 
-        #create neighbor embeddings (includes agent itself as a neighbor)
-        if self.agent_info_size == 0:
-            # Directions observation: no explicit neighbor-info segment.
-            # Just create a zero bias of the same length as the sequence.
-            nbrs_embd = torch.zeros(t, self.transformer.wte.weight.size(1),
-                                    device=device, dtype=self.transformer.wte.weight.dtype)
-        else:
-            nbrs = torch.arange(self.max_num_neighbors, device=device, dtype=torch.long)
-            nbrs = self.transformer.wne(nbrs.repeat_interleave(self.agent_info_size))
-            # Use actual sequence length t so nbrs_embd matches tok_emb/pos_emb along time
-            tail_size = t - self.field_of_view_size - self.max_num_neighbors * self.agent_info_size
-            assert tail_size >= 0, (
-                f"Sequence length {t} is too small. "
-                f"Need at least {self.field_of_view_size + self.max_num_neighbors * self.agent_info_size} tokens, "
-                f"but got {t}"
-            )
-            nbrs_embd = torch.cat(
-                [
-                    torch.zeros(self.field_of_view_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype),
-                    nbrs,
-                    torch.zeros(tail_size, nbrs.shape[-1], device=device, dtype=nbrs.dtype),
-                ],
-                dim=0,
-            )
+        # Directions observation: neighbor-to-FOV alignment is handled via
+        # relative coordinates in message processing, not in the observation itself.
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
@@ -353,7 +327,7 @@ class RepresentationEncoder(nn.Module):
         latent_emb = self.transformer.wle(latent) # position embeddings of shape (latent_tok_n, latent_tok_embd)
         latent_emb = latent_emb.unsqueeze(0).repeat(b,1,1)
 
-        x = self.transformer.drop(tok_emb + pos_emb + nbrs_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
         latent = self.transformer.drop(latent_emb)
 
         for block in self.transformer.h:
@@ -503,7 +477,6 @@ class DMM(nn.Module):
         self.n_comm_rounds = config.n_comm_rounds
 
         self.max_num_neighbors = config.max_num_neighbors
-        self.agent_info_size = config.agent_info_size
         self.field_of_view_size = config.field_of_view_size
         self.block_size = config.block_size
 
@@ -512,6 +485,15 @@ class DMM(nn.Module):
         self.coordinator = MessageCoordinator(self.config)
 
         self.msg_nbrs_embedding = nn.Embedding(self.max_num_neighbors, config.latent_embd)
+        # Relative coordinate embeddings for messages: tells model where in FOV each neighbor is
+        # Using factorized (dx, dy) representation instead of flat FOV index
+        # Range: [-obs_radius, +obs_radius] mapped to [0, 2*obs_radius] = 11 values for radius=5
+        # Extra value for "no neighbor" marker
+        obs_radius = int(math.sqrt(self.field_of_view_size)) // 2  # e.g., 5 for 11x11 FOV
+        self.obs_radius = obs_radius
+        coord_range = 2 * obs_radius + 1 + 1  # 11 positions + 1 "no neighbor" = 12
+        self.msg_dx_embedding = nn.Embedding(coord_range, config.latent_embd)
+        self.msg_dy_embedding = nn.Embedding(coord_range, config.latent_embd)
         # one linear head per predicted future action
         self.num_action_heads = getattr(config, "num_action_heads", 1)
         self.action_heads = nn.ModuleList(
@@ -532,7 +514,7 @@ class DMM(nn.Module):
         # NEW weight tying
     #    self.representation_encoder.transformer.wte.weight = self.representation_decoder.action_head.weight
 
-    def forward(self, observations, agent_chat_ids, target_actions=None):
+    def forward(self, observations, agent_chat_ids, target_actions=None, agents_rel_coords=None):
         B, C, T = observations.shape
         device = observations.device
         _, _, L = agent_chat_ids.shape
@@ -548,11 +530,28 @@ class DMM(nn.Module):
         nbrs = torch.arange(self.max_num_neighbors, device=device, dtype=torch.long)
         nbrs = self.msg_nbrs_embedding(nbrs)
 
+        # create relative coordinate embeddings for messages (if provided)
+        # This tells the model where in the FOV each neighbor is located
+        if agents_rel_coords is not None:
+            # agents_rel_coords: [B, C, L*2] - (dx, dy) pairs for each neighbor
+            # Values in [-obs_radius, obs_radius], or obs_radius+1 for "no neighbor"
+            coords = agents_rel_coords.view(B * C, L, 2)
+            dx = coords[:, :, 0]  # [B*C, L]
+            dy = coords[:, :, 1]  # [B*C, L]
+            # Shift from [-obs_radius, obs_radius] to [0, 2*obs_radius] for embedding lookup
+            # "no neighbor" marker (obs_radius+1) becomes 2*obs_radius+1 after shift
+            dx_idx = dx + self.obs_radius  # [B*C, L]
+            dy_idx = dy + self.obs_radius  # [B*C, L]
+            
+            coord_emb = self.msg_dx_embedding(dx_idx) + self.msg_dy_embedding(dy_idx)  # [B*C, L, latent_embd]
+        else:
+            coord_emb = 0  # no-op if not provided
+
         act_msg_latent = None
         for _ in range(self.n_comm_rounds):
             agent_to_msg = agent_to_msg.view(B, C, -1)
             messages = self.coordinator(agent_to_msg, agent_chat_ids)
-            messages = messages.view(B * C, L, -1) + nbrs[:L]
+            messages = messages.view(B * C, L, -1) + nbrs[:L] + coord_emb
             act_msg_latent = self.representation_decoder(latent, messages, connections)
             agent_to_msg = self.representation_decoder.transformer.msg_head(act_msg_latent)
       
@@ -636,8 +635,8 @@ class DMM(nn.Module):
         return optimizer
 
     @torch.no_grad()
-    def act(self, obs, agent_chat_ids, do_sample=True):
-        logits, _ = self(obs, agent_chat_ids)
+    def act(self, obs, agent_chat_ids, do_sample=True, agents_rel_coords=None):
+        logits, _ = self(obs, agent_chat_ids, agents_rel_coords=agents_rel_coords)
 
         probs = F.softmax(logits, dim=-1)
 

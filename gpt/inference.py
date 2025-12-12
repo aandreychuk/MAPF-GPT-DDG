@@ -105,7 +105,11 @@ class LCMAPFInference:
             else:
                 #import cppimport.import_hook
                 #from gpt.observation_generator_directions import ObservationGeneratorDirections
-                self.observation_generator = ObservationGeneratorDirections(observations[0]['global_obstacles'].copy().astype(int).tolist(), 5, 128)
+                self.observation_generator = ObservationGeneratorDirections(
+                    observations[0]['global_obstacles'].copy().astype(int).tolist(), 
+                    5,  # obs_radius 
+                    self.cfg.context_size
+                )
             self.observation_generator.create_agents(positions, goals)
             self.last_actions = [-1 for _ in range(len(observations))]
         self.observation_generator.update_agents(positions, goals, self.last_actions)
@@ -117,7 +121,18 @@ class LCMAPFInference:
         agent_chat_ids = torch.tensor(agent_chat_ids, dtype=torch.long, device=self.cfg.device)
         agent_chat_ids = agent_chat_ids[None, :, :]
 
-        actions = torch.squeeze(self.net.act(obs=tensor_obs, agent_chat_ids=agent_chat_ids)).tolist()
+        # Get relative coordinates for message-to-FOV alignment (Directions observation)
+        agents_rel_coords = None
+        if self.cfg.observation_type != 'cost2go':
+            rel_coords = self.observation_generator.get_agents_relative_coords()
+            agents_rel_coords = torch.tensor(rel_coords, dtype=torch.long, device=self.cfg.device)
+            agents_rel_coords = agents_rel_coords[None, :, :]
+
+        actions = torch.squeeze(self.net.act(
+            obs=tensor_obs, 
+            agent_chat_ids=agent_chat_ids,
+            agents_rel_coords=agents_rel_coords
+        )).tolist()
 
         if not isinstance(actions, list):
             actions = [actions]
