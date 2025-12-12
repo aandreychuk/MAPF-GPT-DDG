@@ -548,12 +548,18 @@ class DMM(nn.Module):
             coord_emb = 0  # no-op if not provided
 
         act_msg_latent = None
-        for _ in range(self.n_comm_rounds):
-            agent_to_msg = agent_to_msg.view(B, C, -1)
-            messages = self.coordinator(agent_to_msg, agent_chat_ids)
+        if self.n_comm_rounds == 0:
+            messages = torch.zeros(B*C, L, self.config.latent_embd, device=device)
             messages = messages.view(B * C, L, -1) + nbrs[:L] + coord_emb
             act_msg_latent = self.representation_decoder(latent, messages, connections)
             agent_to_msg = self.representation_decoder.transformer.msg_head(act_msg_latent)
+        else:
+            for _ in range(self.n_comm_rounds):
+                agent_to_msg = agent_to_msg.view(B, C, -1)
+                messages = self.coordinator(agent_to_msg, agent_chat_ids)
+                messages = messages.view(B * C, L, -1) + nbrs[:L] + coord_emb
+                act_msg_latent = self.representation_decoder(latent, messages, connections)
+                agent_to_msg = self.representation_decoder.transformer.msg_head(act_msg_latent)
       
         # attention pooling of features
         #action_features = torch.cat(action_features, 1)
