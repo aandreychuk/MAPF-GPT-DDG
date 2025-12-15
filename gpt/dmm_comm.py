@@ -246,7 +246,7 @@ class DMMConfig:
     latent_tok_n: int = 8
     dropout: float = 0.0
     bias: bool = False
-    empty_token_code: int = 66
+    empty_token_code: int = 0
     action_msg_feats: int = 16
     empty_connection_code: int = -1
     n_comm_rounds: int = 2

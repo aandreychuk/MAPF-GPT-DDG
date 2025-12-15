@@ -72,7 +72,8 @@ backend = "nccl"  # 'nccl', 'gloo', etc.
 # system
 device = ("cuda")  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 state_size = 32
-
+empty_token_code = 0
+meta_vocab_size = 97
 if 'cuda' in device and not torch.cuda.is_available():
     device = 'cpu'
     logger.warning(f'Cuda is not available, switching to {device}')
@@ -189,9 +190,6 @@ ctx = (
     if device_type == "cpu"
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
-
-empty_token_code = 66
-meta_vocab_size = 67
 
 def get_batch(data):
     observations, actions, agent_chat_ids, agents_rel_coords = next(data)
