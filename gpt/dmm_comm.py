@@ -8,6 +8,13 @@ import torch.nn as nn
 from loguru import logger
 from torch.nn import functional as F
 
+try:
+    from mamba_ssm import Mamba
+    MAMBA_AVAILABLE = True
+except ImportError:
+    MAMBA_AVAILABLE = False
+    logger.warning("mamba_ssm not available. Please install with: pip install mamba-ssm")
+
 
 class LayerNorm(nn.Module): #RMSNorm
     #""" LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -21,6 +28,164 @@ class LayerNorm(nn.Module): #RMSNorm
 
     def forward(self, input):
         return F.rms_norm(input, self.weight.shape, self.weight, 1e-5)
+
+
+class MambaAttention(nn.Module):
+    """
+    Mamba-based attention replacement for MultiHeadAttention.
+    Uses State Space Models (Mamba) for O(n) complexity instead of O(n²) attention.
+    """
+    def __init__(self,
+                 config,
+                 q_dim: int,
+                 kv_dim: int = None,
+                 n_embd: int = None,
+                 ):
+        """
+        Mamba-based attention with flexible input/output dimensions.
+
+        Args:
+            config : config object with attributes n_embd, n_head, dropout, bias
+            q_dim : input dimension for queries
+            kv_dim : input dimension for keys/values (defaults to q_dim)
+            n_embd : embedding dimension (defaults to config.n_embd)
+        """
+        super().__init__()
+        if not MAMBA_AVAILABLE:
+            raise ImportError("mamba_ssm is required. Install with: pip install mamba-ssm")
+
+        if n_embd is None:
+            self.n_embd = config.n_embd
+        else:
+            self.n_embd = n_embd
+        self.dropout = config.dropout
+        self.q_dim = q_dim
+
+        if kv_dim is None:
+            kv_dim = q_dim
+        self.kv_dim = kv_dim
+
+        # Project inputs to Mamba dimension
+        self.q_proj = nn.Linear(q_dim, self.n_embd, bias=config.bias)
+        
+        # For cross-attention, we need separate processing when dimensions differ
+        # or when we need to handle different sequences
+        if kv_dim != q_dim:
+            self.kv_proj = nn.Linear(kv_dim, self.n_embd, bias=config.bias)
+        else:
+            # Even if dimensions match, we might need cross-attention
+            # So we'll create kv_proj but may not always use it
+            self.kv_proj = None
+
+        # Mamba blocks - using reasonable defaults
+        # d_state: state dimension (larger = more memory, default 16)
+        # d_conv: convolution kernel size (default 4)
+        # expand: expansion factor (default 2)
+        self.mamba_q = Mamba(
+            d_model=self.n_embd,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+        )
+
+        # For cross-attention: process kv separately and combine
+        # We'll create this even if dimensions match, in case sequences differ
+        self.mamba_kv = Mamba(
+            d_model=self.n_embd,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+        )
+        # Combine query and key-value features
+        self.combine = nn.Linear(self.n_embd * 2, self.n_embd, bias=config.bias)
+        self.combine_norm = LayerNorm(self.n_embd, bias=config.bias)
+
+        # Output projection back to q_dim
+        self.c_proj = nn.Linear(self.n_embd, q_dim, bias=config.bias)
+        self.resid_dropout = nn.Dropout(self.dropout)
+        
+        # Normalization layers (similar structure to original)
+        self.ln_q = LayerNorm(self.n_embd, bias=config.bias)
+        self.ln_kv = LayerNorm(self.n_embd, bias=config.bias)
+
+    def forward(self, x_q, x_kv=None, attn_bias=None):
+        """
+        Args:
+            x_q : (B, T_q, q_dim) array to turn into queries
+            x_kv : (B, T_kv, kv_dim) array to turn into keys and values (defaults to x_q)
+            attn_bias : (B, n_head, T_q, T_k) optional attention bias/mask (for empty tokens)
+        Returns:
+            y : (B, T_q, n_embd) attended representations
+        """
+        if x_kv is None:
+            x_kv = x_q
+
+        B, T_q, _ = x_q.size()
+        _, T_kv, _ = x_kv.size()
+
+        # Project to Mamba dimension
+        q = self.q_proj(x_q)  # [B, T_q, n_embd]
+        q = self.ln_q(q)
+
+        # Check if this is cross-attention (different sequences or different dimensions)
+        is_cross_attn = (x_kv is not x_q) or (self.kv_proj is not None)
+        
+        if is_cross_attn and x_kv is not x_q:
+            # Cross-attention: process both query and key-value separately
+            if self.kv_proj is not None:
+                kv = self.kv_proj(x_kv)  # [B, T_kv, n_embd]
+            else:
+                # Same dimension, just project with q_proj
+                kv = self.q_proj(x_kv)  # [B, T_kv, n_embd]
+            kv = self.ln_kv(kv)
+            
+            # Process through Mamba
+            y_q = self.mamba_q(q)  # [B, T_q, n_embd]
+            y_kv = self.mamba_kv(kv)  # [B, T_kv, n_embd]
+            
+            # For cross-attention, we need to align T_kv features to T_q positions
+            # Since Mamba processes sequences, we'll interpolate/align kv to q length
+            if T_kv != T_q:
+                # Interpolate kv features to match q length
+                y_kv = F.interpolate(
+                    y_kv.transpose(1, 2),  # [B, n_embd, T_kv]
+                    size=T_q,
+                    mode='linear',
+                    align_corners=False
+                ).transpose(1, 2)  # [B, T_q, n_embd]
+            
+            # Combine query and key-value features
+            combined = torch.cat([y_q, y_kv], dim=-1)  # [B, T_q, 2*n_embd]
+            y = self.combine(combined)  # [B, T_q, n_embd]
+            y = self.combine_norm(y)
+        else:
+            # Self-attention: just process query through Mamba
+            y = self.mamba_q(q)  # [B, T_q, n_embd]
+
+        # Apply masking for empty tokens (from attn_bias)
+        # attn_bias shape: [B, n_head, T_q, T_k]
+        # We'll create a mask that zeros out positions where all heads have -inf
+        if attn_bias is not None:
+            # Check if any position is masked (has -inf)
+            # Since we don't have heads in Mamba, we'll check if all heads mask a position
+            mask = (attn_bias != float('-inf')).any(dim=1)  # [B, T_q, T_k]
+            # For self-attention, mask should be [B, T_q, T_q]
+            # We'll use the diagonal or first column to get per-position mask
+            if mask.size(-1) == T_q:
+                # Self-attention case: use diagonal
+                position_mask = mask.diagonal(dim1=1, dim2=2)  # [B, T_q]
+            else:
+                # Cross-attention: check if query positions are valid
+                # Use first column or average across kv dimension
+                position_mask = mask.any(dim=-1)  # [B, T_q]
+            
+            # Apply mask: zero out masked positions
+            position_mask = position_mask.unsqueeze(-1).float()  # [B, T_q, 1]
+            y = y * position_mask
+
+        # Project back to q_dim
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 
 class MultiHeadAttention(nn.Module):
@@ -205,7 +370,7 @@ class Block(nn.Module):
 
         self.ln_1q = LayerNorm(q_dim, bias=config.bias)
         self.ln_1kv = LayerNorm(kv_dim, bias=config.bias)
-        self.attn = MultiHeadAttention(
+        self.attn = MambaAttention(
             config, q_dim, kv_dim, n_embd
         )
        # self.attn = MLA_NonCausalSelfAttention(config, q_dim=64)
