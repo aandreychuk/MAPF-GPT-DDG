@@ -6,6 +6,7 @@ multiprocessing.set_start_method("spawn", force=True)
 
 
 from gpt.dmm_comm import DMM, DMMConfig
+from gpt.dmm_gnn import DMMGNN, DMMGNNConfig
 from loguru import logger
 from gpt.aggregated_data_loader import AggregatedMapfArrowDataset
 import math
@@ -84,6 +85,9 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False  # use PyTorch 2.0 to compile the model to be faster
+
+# Architecture selection
+architecture = "transformer"  # 'transformer' or 'gnn'
 # -----------------------------------------------------------------------------
 
 current_train_index = 0
@@ -97,6 +101,9 @@ config_keys = [
     for k, v in globals().items()
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
+# Ensure architecture is in config
+if "architecture" not in config_keys:
+    config_keys.append("architecture")
 exec(open("gpt/configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
@@ -229,31 +236,101 @@ model_args = dict(
     loss_weights = loss_weights,
 )  # start with model_args from command line
 
+# Determine which architecture to use
+use_gnn = architecture.lower() == "gnn"
+if use_gnn:
+    logger.info("Using GNN-based architecture (DMMGNN)")
+else:
+    logger.info("Using Transformer-based architecture (DMM)")
+
 if init_from == "scratch":
     # init a new model from scratch
     logger.info("Initializing a new model from scratch")
     model_args["vocab_size"] = meta_vocab_size
-    gptconf = DMMConfig(**model_args)
-    model = DMM(gptconf)
+    
+    if use_gnn:
+        # Convert DMM args to GNN args
+        gnn_args = {
+            "block_size": model_args.get("block_size", 128),
+            "vocab_size": meta_vocab_size,
+            "field_of_view_size": model_args.get("field_of_view_size", 121),
+            "max_num_neighbors": model_args.get("max_num_neighbors", 13),
+            "n_gnn_layers": model_args.get("n_encoder_layer", 2),  # Use encoder layers as GNN layers
+            "gnn_heads": model_args.get("n_head", 2),
+            "n_embd": model_args.get("n_embd", 16),
+            "latent_embd": model_args.get("latent_embd", 8),
+            "dropout": model_args.get("dropout", 0.0),
+            "bias": model_args.get("bias", False),
+            "empty_token_code": model_args.get("empty_token_code", 0),
+            "action_msg_feats": model_args.get("action_msg_feats", 16),
+            "empty_connection_code": model_args.get("empty_connection_code", -1),
+            "n_comm_rounds": model_args.get("n_comm_rounds", 2),
+            "num_action_heads": model_args.get("num_action_heads", 1),
+            "loss_weights": model_args.get("loss_weights", None),
+            "n_resnet_blocks": model_args.get("n_resnet_blocks", 2),  # ResNet blocks in spatial encoder
+        }
+        gptconf = DMMGNNConfig(**gnn_args)
+        model = DMMGNN(gptconf)
+    else:
+        gptconf = DMMConfig(**model_args)
+        model = DMM(gptconf)
+        
 elif init_from == "resume":
     logger.info(f"Resuming training from {exp_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(exp_dir, "ckpt.pt")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
+    
+    # Check if checkpoint uses GNN or transformer
+    checkpoint_arch = checkpoint_model_args.get("architecture", "transformer")
+    use_checkpoint_gnn = checkpoint_arch.lower() == "gnn"
+    
+    if use_checkpoint_gnn != use_gnn:
+        logger.warning(f"Checkpoint architecture ({checkpoint_arch}) differs from requested ({architecture}). Using checkpoint architecture.")
+        use_gnn = use_checkpoint_gnn
+    
     # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["n_encoder_layer", "n_decoder_layer",
-        "action_msg_feats", "empty_connection_code", "n_comm_rounds",
-        "latent_embd", "latent_tok_n", "field_of_view_size",
-        "max_num_neighbors", "empty_token_code",
-        "n_head", "n_embd", "block_size", "bias",
-        "vocab_size"]:
-        if k in checkpoint_model_args:
-            model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = DMMConfig(**model_args)
-    model = DMM(gptconf)
+    if use_gnn:
+        for k in ["action_msg_feats", "empty_connection_code", "n_comm_rounds",
+            "latent_embd", "field_of_view_size", "max_num_neighbors", "empty_token_code",
+            "n_embd", "block_size", "bias", "vocab_size", "n_gnn_layers", "gnn_heads", "n_resnet_blocks"]:
+            if k in checkpoint_model_args:
+                model_args[k] = checkpoint_model_args[k]
+        # Convert to GNN args
+        gnn_args = {
+            "block_size": model_args.get("block_size", 128),
+            "vocab_size": model_args.get("vocab_size", 97),
+            "field_of_view_size": model_args.get("field_of_view_size", 121),
+            "max_num_neighbors": model_args.get("max_num_neighbors", 13),
+            "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
+            "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
+            "n_embd": model_args.get("n_embd", 16),
+            "latent_embd": model_args.get("latent_embd", 8),
+            "dropout": model_args.get("dropout", 0.0),
+            "bias": model_args.get("bias", False),
+            "empty_token_code": model_args.get("empty_token_code", 0),
+            "action_msg_feats": model_args.get("action_msg_feats", 16),
+            "empty_connection_code": model_args.get("empty_connection_code", -1),
+            "n_comm_rounds": model_args.get("n_comm_rounds", 2),
+            "num_action_heads": model_args.get("num_action_heads", 1),
+            "loss_weights": model_args.get("loss_weights", None),
+            "n_resnet_blocks": model_args.get("n_resnet_blocks", model_args.get("n_resnet_blocks", 2)),
+        }
+        gptconf = DMMGNNConfig(**gnn_args)
+        model = DMMGNN(gptconf)
+    else:
+        for k in ["n_encoder_layer", "n_decoder_layer",
+            "action_msg_feats", "empty_connection_code", "n_comm_rounds",
+            "latent_embd", "latent_tok_n", "field_of_view_size",
+            "max_num_neighbors", "empty_token_code",
+            "n_head", "n_embd", "block_size", "bias",
+            "vocab_size"]:
+            if k in checkpoint_model_args:
+                model_args[k] = checkpoint_model_args[k]
+        gptconf = DMMConfig(**model_args)
+        model = DMM(gptconf)
+    
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -261,7 +338,7 @@ elif init_from == "resume":
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)  # strict=False for architecture differences
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 
@@ -358,10 +435,14 @@ while True:
 
         if always_save_checkpoint:
             if iter_num > 0 and (iter_num // eval_interval % ckpt_every_n_eval == 0):
+                # Add architecture to model_args for checkpoint
+                checkpoint_model_args = model_args.copy()
+                checkpoint_model_args["architecture"] = architecture
+                
                 checkpoint = {
                     "model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "model_args": model_args,
+                    "model_args": checkpoint_model_args,
                     "iter_num": iter_num,
                     "best_val_loss": best_val_loss,
                     "config": config,

@@ -7,13 +7,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 from torch.nn import functional as F
-
-try:
-    from mamba_ssm import Mamba
-    MAMBA_AVAILABLE = True
-except ImportError:
-    MAMBA_AVAILABLE = False
-    logger.warning("mamba_ssm not available. Please install with: pip install mamba-ssm")
+from mambapy.mamba import Mamba, MambaConfig
 
 
 class LayerNorm(nn.Module): #RMSNorm
@@ -51,8 +45,6 @@ class MambaAttention(nn.Module):
             n_embd : embedding dimension (defaults to config.n_embd)
         """
         super().__init__()
-        if not MAMBA_AVAILABLE:
-            raise ImportError("mamba_ssm is required. Install with: pip install mamba-ssm")
 
         if n_embd is None:
             self.n_embd = config.n_embd
@@ -81,21 +73,19 @@ class MambaAttention(nn.Module):
         # d_state: state dimension (larger = more memory, default 16)
         # d_conv: convolution kernel size (default 4)
         # expand: expansion factor (default 2)
-        self.mamba_q = Mamba(
+        self.mamba_q = Mamba(MambaConfig(
             d_model=self.n_embd,
-            d_state=16,
+            d_state=8,
             d_conv=4,
-            expand=2,
-        )
+            n_layers=1,
+            expand_factor=2,
+        ))
 
-        # For cross-attention: process kv separately and combine
-        # We'll create this even if dimensions match, in case sequences differ
-        self.mamba_kv = Mamba(
-            d_model=self.n_embd,
-            d_state=16,
-            d_conv=4,
-            expand=2,
-        )
+        # For cross-attention: only create mamba_kv if we actually need it
+        # This saves ~50% parameters for self-attention cases
+        # We'll create it lazily in forward() if needed for cross-attention
+        # Initialize as None - will be created on-demand for cross-attention
+        self.mamba_kv = None
         # Combine query and key-value features
         self.combine = nn.Linear(self.n_embd * 2, self.n_embd, bias=config.bias)
         self.combine_norm = LayerNorm(self.n_embd, bias=config.bias)
@@ -132,6 +122,21 @@ class MambaAttention(nn.Module):
         
         if is_cross_attn and x_kv is not x_q:
             # Cross-attention: process both query and key-value separately
+            # Lazy creation of mamba_kv to save parameters for self-attention cases
+            if self.mamba_kv is None:
+                self.mamba_kv = Mamba(MambaConfig(
+                    d_model=self.n_embd,
+                    d_state=8,
+                    d_conv=4,
+                    n_layers=1,
+                    expand_factor=2,
+                ))
+                # Register as a submodule so parameters are tracked
+                self.add_module('mamba_kv', self.mamba_kv)
+                # Move to same device as mamba_q
+                if next(self.mamba_q.parameters()).is_cuda:
+                    self.mamba_kv = self.mamba_kv.cuda()
+            
             if self.kv_proj is not None:
                 kv = self.kv_proj(x_kv)  # [B, T_kv, n_embd]
             else:
@@ -370,9 +375,8 @@ class Block(nn.Module):
 
         self.ln_1q = LayerNorm(q_dim, bias=config.bias)
         self.ln_1kv = LayerNorm(kv_dim, bias=config.bias)
-        self.attn = MambaAttention(
-            config, q_dim, kv_dim, n_embd
-        )
+        self.attn = MambaAttention(config, q_dim, kv_dim, n_embd)
+        #self.attn = MultiHeadAttention(config, q_dim, kv_dim, n_embd)
        # self.attn = MLA_NonCausalSelfAttention(config, q_dim=64)
         self.ln_2 = LayerNorm(q_dim, bias=config.bias)
         self.mlp = SwiGLU_MLP(
