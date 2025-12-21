@@ -1,6 +1,8 @@
 import glob
 import os
 import time
+import threading
+from queue import Queue
 
 import numpy as np
 import pyarrow as pa
@@ -40,6 +42,18 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         logger.info(
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
+        
+        # Pre-allocated buffers for async loading of next file
+        self.next_input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
+        self.next_target_tensors = torch.full(sample_target_tensors.shape, -1, dtype=self.dtype, device=self.device)
+        self.next_agents_in_obs = torch.empty(sample_agents_in_obs.shape, dtype=self.dtype, device=self.device)
+        self.next_agents_rel_coords = torch.empty(sample_rel_coords.shape, dtype=self.dtype, device=self.device)
+        
+        # Threading support for async loading
+        self._preload_thread = None
+        self._preload_queue = Queue(maxsize=1)  # Queue to signal when preload is complete
+        self._preload_lock = threading.Lock()
+        self._next_file_ready = False
 
     @staticmethod
     def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13):
@@ -99,28 +113,123 @@ class MapfArrowDataset(torch.utils.data.Dataset):
 
         return input_tensors, gt_actions, agents_in_obs, agents_rel_coords
 
-    def load_and_transfer_data_file(self, filename):
+    def load_and_transfer_data_file(self, filename, use_next_buffers=False):
         start_time = time.monotonic()
 
         input_tensors, gt_actions, agents_in_obs, agents_rel_coords = self._get_data_from_file(filename)
 
-        self.input_tensors.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
-        self.target_tensors.copy_(torch.tensor(gt_actions, dtype=self.dtype), non_blocking=True)
-        self.agents_in_obs.copy_(torch.tensor(agents_in_obs, dtype=self.dtype), non_blocking=True)
-        self.agents_rel_coords.copy_(torch.tensor(agents_rel_coords, dtype=self.dtype), non_blocking=True)
+        if use_next_buffers:
+            target_input = self.next_input_tensors
+            target_target = self.next_target_tensors
+            target_agents = self.next_agents_in_obs
+            target_coords = self.next_agents_rel_coords
+        else:
+            target_input = self.input_tensors
+            target_target = self.target_tensors
+            target_agents = self.agents_in_obs
+            target_coords = self.agents_rel_coords
+
+        target_input.copy_(torch.tensor(input_tensors, dtype=self.dtype), non_blocking=True)
+        target_target.copy_(torch.tensor(gt_actions, dtype=self.dtype), non_blocking=True)
+        target_agents.copy_(torch.tensor(agents_in_obs, dtype=self.dtype), non_blocking=True)
+        target_coords.copy_(torch.tensor(agents_rel_coords, dtype=self.dtype), non_blocking=True)
 
         finish_time = time.monotonic() - start_time
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
+        
+        if use_next_buffers:
+            with self._preload_lock:
+                self._next_file_ready = True
+            self._preload_queue.put(True)  # Signal that preload is complete
+
+    def _preload_next_file(self, filename):
+        """Load next file asynchronously into next_* buffers"""
+        try:
+            self.load_and_transfer_data_file(filename, use_next_buffers=True)
+        except Exception as e:
+            logger.error(f"Error preloading file {filename}: {e}")
+            with self._preload_lock:
+                self._next_file_ready = False
+            self._preload_queue.put(False)  # Signal error
+
+    def _start_preload(self, filename):
+        """Start async preloading of next file"""
+        with self._preload_lock:
+            self._next_file_ready = False
+        # Clear queue in case there's a stale signal
+        while not self._preload_queue.empty():
+            try:
+                self._preload_queue.get_nowait()
+            except:
+                break
+        
+        if self._preload_thread is not None and self._preload_thread.is_alive():
+            self._preload_thread.join(timeout=0.1)  # Wait briefly for previous preload to finish
+        
+        self._preload_thread = threading.Thread(target=self._preload_next_file, args=(filename,), daemon=True)
+        self._preload_thread.start()
+
+    def _swap_buffers(self):
+        """Swap current and next buffers after next file is loaded"""
+        with self._preload_lock:
+            if not self._next_file_ready:
+                return False
+            
+            # Swap buffers
+            self.input_tensors, self.next_input_tensors = self.next_input_tensors, self.input_tensors
+            self.target_tensors, self.next_target_tensors = self.next_target_tensors, self.target_tensors
+            self.agents_in_obs, self.next_agents_in_obs = self.next_agents_in_obs, self.agents_in_obs
+            self.agents_rel_coords, self.next_agents_rel_coords = self.next_agents_rel_coords, self.agents_rel_coords
+            
+            self._next_file_ready = False
+            return True
 
     def __iter__(self):
         while True:
-            for file_path in self.file_paths:
-                self.load_and_transfer_data_file(file_path)
-                for i in range(0, len(self.input_tensors), self.batch_size):
+            for file_idx, file_path in enumerate(self.file_paths):
+                # Check if we have a preloaded file ready (works for wrap-around too)
+                if self._swap_buffers():
+                    # Successfully swapped, next file was already loaded
+                    pass
+                else:
+                    # Load current file synchronously (first iteration or preload didn't complete)
+                    self.load_and_transfer_data_file(file_path)
+                
+                # Start preloading next file asynchronously (if not the last file)
+                next_file_idx = (file_idx + 1) % len(self.file_paths)
+                if len(self.file_paths) > 1:  # Only preload if there are multiple files
+                    next_file_path = self.file_paths[next_file_idx]
+                    self._start_preload(next_file_path)
+                
+                # Yield batches from current file
+                num_batches = (len(self.input_tensors) + self.batch_size - 1) // self.batch_size
+                for batch_idx in range(num_batches):
+                    i = batch_idx * self.batch_size
                     yield (self.input_tensors[i:i + self.batch_size], 
                            self.target_tensors[i:i + self.batch_size], 
                            self.agents_in_obs[i:i + self.batch_size],
                            self.agents_rel_coords[i:i + self.batch_size])
+                    
+                    # On the last batch of current file, check if preload is ready
+                    # If not ready yet, wait for it (but this is non-blocking for training
+                    # since we're done with current file anyway)
+                    if batch_idx == num_batches - 1 and len(self.file_paths) > 1:
+                        # Check if preload is already complete
+                        with self._preload_lock:
+                            is_ready = self._next_file_ready
+                        
+                        if not is_ready:
+                            # Wait for preload to finish (with timeout to avoid infinite wait)
+                            try:
+                                result = self._preload_queue.get(timeout=30.0)  # 30 second timeout
+                                if not result:
+                                    logger.warning(f"Preload failed for {next_file_path}, will load synchronously")
+                            except:
+                                logger.warning(f"Preload timeout for {next_file_path}, will load synchronously")
+                        
+                        # Ensure thread has finished
+                        if self._preload_thread is not None:
+                            self._preload_thread.join(timeout=1.0)
 
     def get_shard_size(self):
         return len(self.input_tensors) * len(self.file_paths)
