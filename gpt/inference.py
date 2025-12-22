@@ -8,6 +8,7 @@ from pogema_toolbox.run_episode import run_episode
 from pydantic import Extra
 
 #from gpt.model import LCMAPF, Config
+from gpt.dmm_gnn import DMMGNN, DMMGNNConfig
 from gpt.dmm_comm import DMM, DMMConfig
 import cppimport.import_hook
 from gpt.observation_generator import InputParameters, ObservationGenerator
@@ -36,6 +37,7 @@ class LCMAPFInferenceConfig(AlgoBase, extra=Extra.forbid):
     save_cost2go: bool = False
     num_rounds: int = 2
     observation_type = 'cost2go'
+    model_type: Optional[Literal["dmm", "gnn"]] = None  # None = auto-detect from checkpoint
 
 
 def strip_prefix_from_state_dict(state_dict, prefix="_orig_mod."):
@@ -82,9 +84,22 @@ class LCMAPFInference:
         model_state_dict = strip_prefix_from_state_dict(checkpoint["model"])
         config_dict = checkpoint.get("model_args")
         config_dict["n_comm_rounds"] = cfg.num_rounds
-        config = DMMConfig(**config_dict)
-
-        self.net = DMM(config)
+        
+        # Determine model type: use config if provided, otherwise auto-detect from checkpoint
+        model_type = cfg.model_type
+        if model_type is None:
+            # Auto-detect: check if checkpoint has GNN-specific keys
+            has_gnn_keys = any("graph_encoder" in k or "graph_decoder" in k or "gnn_layers" in k 
+                              for k in model_state_dict.keys())
+            model_type = "gnn" if has_gnn_keys else "dmm"
+        
+        # Instantiate appropriate model
+        if model_type == "gnn":
+            config = DMMGNNConfig(**config_dict)
+            self.net = DMMGNN(config)
+        else:  # model_type == "dmm"
+            config = DMMConfig(**config_dict)
+            self.net = DMM(config)
         self.net.load_state_dict(model_state_dict, strict=False)
         self.net.to(self.cfg.device)
         self.net.eval()
