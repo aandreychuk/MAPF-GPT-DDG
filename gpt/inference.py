@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Literal, Optional
+from dataclasses import fields
 
 import torch
 from pogema_toolbox.algorithm_config import AlgoBase
@@ -82,7 +83,7 @@ class LCMAPFInference:
                                 weights_only=False)
        
         model_state_dict = strip_prefix_from_state_dict(checkpoint["model"])
-        config_dict = checkpoint.get("model_args")
+        config_dict = checkpoint.get("model_args", {})
         config_dict["n_comm_rounds"] = cfg.num_rounds
         
         # Determine model type: use config if provided, otherwise auto-detect from checkpoint
@@ -93,12 +94,51 @@ class LCMAPFInference:
                               for k in model_state_dict.keys())
             model_type = "gnn" if has_gnn_keys else "dmm"
         
-        # Instantiate appropriate model
+        # Filter config_dict to only include valid parameters for the selected model type
         if model_type == "gnn":
-            config = DMMGNNConfig(**config_dict)
+            # Get valid field names from DMMGNNConfig
+            valid_fields = {f.name for f in fields(DMMGNNConfig)}
+            filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+            
+            # Map DMM parameters to GNN parameters if needed (for backward compatibility)
+            # This handles checkpoints that were saved with DMM parameter names
+            if "gnn_heads" not in filtered_config:
+                # Try to get from n_head if available, otherwise infer from checkpoint weights
+                if "n_head" in config_dict:
+                    filtered_config["gnn_heads"] = config_dict["n_head"]
+                elif "gnn_heads" in config_dict:
+                    filtered_config["gnn_heads"] = config_dict["gnn_heads"]
+                else:
+                    # Try to infer from checkpoint weights (check first GNN layer)
+                    # Format: graph_encoder.gnn_layers.0.conv.lin_key.weight has shape [num_heads * out_channels, in_channels]
+                    # Since out_channels == in_channels == latent_embd in GraphTransformerLayer,
+                    # we can infer: num_heads = weight.shape[0] / weight.shape[1]
+                    for key in model_state_dict.keys():
+                        if "gnn_layers.0.conv.lin_key.weight" in key:
+                            weight_shape = model_state_dict[key].shape
+                            if len(weight_shape) == 2:
+                                # num_heads = (num_heads * out_channels) / in_channels
+                                # Since out_channels == in_channels, num_heads = weight_shape[0] / weight_shape[1]
+                                inferred_heads = weight_shape[0] // weight_shape[1]
+                                filtered_config["gnn_heads"] = inferred_heads
+                                break
+                    else:
+                        # Default fallback if we can't infer from weights
+                        filtered_config["gnn_heads"] = 3
+            if "n_gnn_layers" not in filtered_config:
+                # Try to get from n_encoder_layer if available
+                filtered_config["n_gnn_layers"] = config_dict.get("n_gnn_layers", config_dict.get("n_encoder_layer", 2))
+            if "n_resnet_blocks" not in filtered_config:
+                # Use default if not available
+                filtered_config["n_resnet_blocks"] = config_dict.get("n_resnet_blocks", 2)
+            
+            config = DMMGNNConfig(**filtered_config)
             self.net = DMMGNN(config)
         else:  # model_type == "dmm"
-            config = DMMConfig(**config_dict)
+            # Get valid field names from DMMConfig
+            valid_fields = {f.name for f in fields(DMMConfig)}
+            filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+            config = DMMConfig(**filtered_config)
             self.net = DMM(config)
         self.net.load_state_dict(model_state_dict, strict=False)
         self.net.to(self.cfg.device)
