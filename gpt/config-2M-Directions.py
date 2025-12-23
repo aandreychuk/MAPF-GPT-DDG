@@ -9,29 +9,22 @@ train_data_files = ['dataset/mazes', 'dataset/random']
 eval_interval = 1000
 ckpt_every_n_eval = 100
 
-# Architecture
-architecture = "gnn"
+# Input Configuration
+block_size = 128
+vocab_size = 97
+field_of_view_size = 121
 
-# GNN Model Configuration
-block_size: int = 128
-vocab_size: int = 97
-field_of_view_size: int = 121
+# GNN architecture parameters
+n_gnn_layers = 3          # Number of GNN layers in encoder
+gnn_heads = 4             # Number of attention heads in graph transformer
+n_resnet_blocks = 2       # Number of ResNet blocks in spatial encoder
 
-# GNN-specific architecture parameters
-n_gnn_layers: int = 3  # Number of GNN layers in encoder
-gnn_heads: int = 3  # Number of attention heads in graph transformer
-n_resnet_blocks: int = 3  # Number of ResNet blocks in spatial encoder
+# Model dimensions
+n_embd = 64 * 3           # Token/FOV embedding dimension
+latent_embd = 32 * 4      # Latent node embedding dimension
+action_msg_feats = 32 * 4 # Features for action prediction
 
-# Shared model parameters
-n_embd: int = 64*3
-latent_embd: int = 32*3
-action_msg_feats: int = 32*3
-n_comm_rounds: int = 3
-num_action_heads: int = 3
-loss_weights = (4, 2, 1)  # weights for 3 action heads: [a0, a1, a2]
-
-# Optional parameters (with defaults)
-dropout: float = 0.0
-bias: bool = False
-empty_token_code: int = 0
-empty_connection_code: int = -1
+# Communication and action prediction
+n_comm_rounds = 1         # Message passing rounds in decoder
+num_action_heads = 2      # Number of future actions to predict
+loss_weights = (3, 1)  # Loss weights for each action head [a0, a1, a2]

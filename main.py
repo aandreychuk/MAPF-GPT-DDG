@@ -5,7 +5,6 @@ from pathlib import Path
 multiprocessing.set_start_method("spawn", force=True)
 
 
-from gpt.dmm_comm import DMM, DMMConfig
 from gpt.dmm_gnn import DMMGNN, DMMGNNConfig
 from loguru import logger
 from gpt.aggregated_data_loader import AggregatedMapfArrowDataset
@@ -35,20 +34,18 @@ init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 
 gradient_accumulation_steps = 16  # used to simulate larger batch sizes
 block_size = 256
-# model
-n_encoder_layer = 2
-n_decoder_layer = 2
-
-n_head = 2
-n_embd = 80
-latent_embd = 40
-latent_tok_n = 32
-action_msg_feats = 80
-num_action_heads = 3
-loss_weights = (4, 2, 1)
+# GNN model defaults (can be overridden by config file)
+n_gnn_layers = 2          # number of GNN layers in encoder
+gnn_heads = 2             # attention heads in graph transformer
+n_resnet_blocks = 2       # ResNet blocks in spatial encoder
+n_embd = 80               # token/FOV embedding dim
+latent_embd = 40          # latent node embedding dim
+action_msg_feats = 80     # features for action head
+n_comm_rounds = 2         # message passing rounds in decoder
+num_action_heads = 3      # number of future actions predicted
+loss_weights = (4, 2, 1)  # weights for action heads
 
 empty_connection_code = -1
-n_comm_rounds = 2
 
 field_of_view_size = 11*11
 max_num_neighbors = 13
@@ -84,9 +81,6 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False  # use PyTorch 2.0 to compile the model to be faster
-
-# Architecture selection
-architecture = "transformer"  # 'transformer' or 'gnn'
 # -----------------------------------------------------------------------------
 
 current_train_index = 0
@@ -100,9 +94,6 @@ config_keys = [
     for k, v in globals().items()
     if not k.startswith("_") and isinstance(v, (int, float, bool, str))
 ]
-# Ensure architecture is in config
-if "architecture" not in config_keys:
-    config_keys.append("architecture")
 exec(open("gpt/configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
@@ -213,121 +204,86 @@ def get_batch(data):
 iter_num = 0
 best_val_loss = 1e9
 
-# model init
+# model init (we keep a simple dict for checkpoint compatibility)
 model_args = dict(
-    n_encoder_layer = n_encoder_layer,
-    n_decoder_layer = n_decoder_layer,
-    n_head=n_head,
+    n_gnn_layers=n_gnn_layers,
+    gnn_heads=gnn_heads,
+    n_resnet_blocks=n_resnet_blocks,
     n_embd=n_embd,
     block_size=block_size,
     bias=bias,
     vocab_size=None,
     dropout=dropout,
-
-    action_msg_feats = action_msg_feats,
-    empty_connection_code = empty_connection_code,
-    n_comm_rounds = n_comm_rounds,
-    latent_embd = latent_embd,
-    latent_tok_n = latent_tok_n,
-    field_of_view_size = field_of_view_size,
-    empty_token_code = empty_token_code,
-    num_action_heads = num_action_heads,
-    loss_weights = loss_weights,
-)  # start with model_args from command line
-
-# Determine which architecture to use
-use_gnn = architecture.lower() == "gnn"
-if use_gnn:
-    logger.info("Using GNN-based architecture (DMMGNN)")
-else:
-    logger.info("Using Transformer-based architecture (DMM)")
+    action_msg_feats=action_msg_feats,
+    empty_connection_code=empty_connection_code,
+    n_comm_rounds=n_comm_rounds,
+    latent_embd=latent_embd,
+    field_of_view_size=field_of_view_size,
+    empty_token_code=empty_token_code,
+    num_action_heads=num_action_heads,
+    loss_weights=loss_weights,
+)  # populated from defaults, then possibly overridden by config/checkpoint
 
 if init_from == "scratch":
-    # init a new model from scratch
-    logger.info("Initializing a new model from scratch")
+    # init a new GNN model from scratch
+    logger.info("Initializing a new GNN model from scratch")
     model_args["vocab_size"] = meta_vocab_size
-    
-    if use_gnn:
-        # Convert DMM args to GNN args
-        # Check for GNN-specific names first, then fall back to old names for compatibility
-        gnn_args = {
-            "block_size": model_args.get("block_size", 128),
-            "vocab_size": meta_vocab_size,
-            "field_of_view_size": model_args.get("field_of_view_size", 121),
-            "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
-            "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
-            "n_embd": model_args.get("n_embd", 16),
-            "latent_embd": model_args.get("latent_embd", 8),
-            "dropout": model_args.get("dropout", 0.0),
-            "bias": model_args.get("bias", False),
-            "empty_token_code": model_args.get("empty_token_code", 0),
-            "action_msg_feats": model_args.get("action_msg_feats", 16),
-            "empty_connection_code": model_args.get("empty_connection_code", -1),
-            "n_comm_rounds": model_args.get("n_comm_rounds", 2),
-            "num_action_heads": model_args.get("num_action_heads", 1),
-            "loss_weights": model_args.get("loss_weights", None),
-            "n_resnet_blocks": model_args.get("n_resnet_blocks", 2),  # ResNet blocks in spatial encoder
-        }
-        gptconf = DMMGNNConfig(**gnn_args)
-        model = DMMGNN(gptconf)
-    else:
-        gptconf = DMMConfig(**model_args)
-        model = DMM(gptconf)
-        
+
+    gnn_args = {
+        "block_size": model_args["block_size"],
+        "vocab_size": model_args["vocab_size"],
+        "field_of_view_size": model_args["field_of_view_size"],
+        "n_gnn_layers": model_args["n_gnn_layers"],
+        "gnn_heads": model_args["gnn_heads"],
+        "n_embd": model_args["n_embd"],
+        "latent_embd": model_args["latent_embd"],
+        "dropout": model_args["dropout"],
+        "bias": model_args["bias"],
+        "empty_token_code": model_args["empty_token_code"],
+        "action_msg_feats": model_args["action_msg_feats"],
+        "empty_connection_code": model_args["empty_connection_code"],
+        "n_comm_rounds": model_args["n_comm_rounds"],
+        "num_action_heads": model_args["num_action_heads"],
+        "loss_weights": model_args["loss_weights"],
+        "n_resnet_blocks": model_args["n_resnet_blocks"],
+    }
+    gptconf = DMMGNNConfig(**gnn_args)
+    model = DMMGNN(gptconf)
+
 elif init_from == "resume":
     logger.info(f"Resuming training from {exp_dir}")
-    # resume training from a checkpoint.
+    # resume training from a GNN checkpoint
     ckpt_path = os.path.join(exp_dir, "ckpt.pt")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint["model_args"]
     
-    # Check if checkpoint uses GNN or transformer
-    checkpoint_arch = checkpoint_model_args.get("architecture", "transformer")
-    use_checkpoint_gnn = checkpoint_arch.lower() == "gnn"
-    
-    if use_checkpoint_gnn != use_gnn:
-        logger.warning(f"Checkpoint architecture ({checkpoint_arch}) differs from requested ({architecture}). Using checkpoint architecture.")
-        use_gnn = use_checkpoint_gnn
-    
     # force these config attributes to be equal otherwise we can't even resume training
-    if use_gnn:
-        for k in ["action_msg_feats", "empty_connection_code", "n_comm_rounds",
-            "latent_embd", "field_of_view_size", "empty_token_code",
-            "n_embd", "block_size", "bias", "vocab_size", "n_gnn_layers", "gnn_heads", "n_resnet_blocks"]:
-            if k in checkpoint_model_args:
-                model_args[k] = checkpoint_model_args[k]
-        # Convert to GNN args
-        gnn_args = {
-            "block_size": model_args.get("block_size", 128),
-            "vocab_size": model_args.get("vocab_size", 97),
-            "field_of_view_size": model_args.get("field_of_view_size", 121),
-            "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
-            "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
-            "n_embd": model_args.get("n_embd", 16),
-            "latent_embd": model_args.get("latent_embd", 8),
-            "dropout": model_args.get("dropout", 0.0),
-            "bias": model_args.get("bias", False),
-            "empty_token_code": model_args.get("empty_token_code", 0),
-            "action_msg_feats": model_args.get("action_msg_feats", 16),
-            "empty_connection_code": model_args.get("empty_connection_code", -1),
-            "n_comm_rounds": model_args.get("n_comm_rounds", 2),
-            "num_action_heads": model_args.get("num_action_heads", 1),
-            "loss_weights": model_args.get("loss_weights", None),
-            "n_resnet_blocks": model_args.get("n_resnet_blocks", model_args.get("n_resnet_blocks", 2)),
-        }
-        gptconf = DMMGNNConfig(**gnn_args)
-        model = DMMGNN(gptconf)
-    else:
-        for k in ["n_encoder_layer", "n_decoder_layer",
-            "action_msg_feats", "empty_connection_code", "n_comm_rounds",
-            "latent_embd", "latent_tok_n", "field_of_view_size",
-            "max_num_neighbors", "empty_token_code",
-            "n_head", "n_embd", "block_size", "bias",
-            "vocab_size"]:
-            if k in checkpoint_model_args:
-                model_args[k] = checkpoint_model_args[k]
-        gptconf = DMMConfig(**model_args)
-        model = DMM(gptconf)
+    for k in ["action_msg_feats", "empty_connection_code", "n_comm_rounds",
+        "latent_embd", "field_of_view_size", "empty_token_code",
+        "n_embd", "block_size", "bias", "vocab_size", "n_gnn_layers", "gnn_heads", "n_resnet_blocks"]:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
+    # Convert to GNN args
+    gnn_args = {
+        "block_size": model_args.get("block_size", 128),
+        "vocab_size": model_args.get("vocab_size", 97),
+        "field_of_view_size": model_args.get("field_of_view_size", 121),
+        "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
+        "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
+        "n_embd": model_args.get("n_embd", 16),
+        "latent_embd": model_args.get("latent_embd", 8),
+        "dropout": model_args.get("dropout", 0.0),
+        "bias": model_args.get("bias", False),
+        "empty_token_code": model_args.get("empty_token_code", 0),
+        "action_msg_feats": model_args.get("action_msg_feats", 16),
+        "empty_connection_code": model_args.get("empty_connection_code", -1),
+        "n_comm_rounds": model_args.get("n_comm_rounds", 2),
+        "num_action_heads": model_args.get("num_action_heads", 1),
+        "loss_weights": model_args.get("loss_weights", None),
+        "n_resnet_blocks": model_args.get("n_resnet_blocks", model_args.get("n_resnet_blocks", 2)),
+    }
+    gptconf = DMMGNNConfig(**gnn_args)
+    model = DMMGNN(gptconf)
     
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
@@ -433,10 +389,26 @@ while True:
 
         if always_save_checkpoint:
             if iter_num > 0 and (iter_num // eval_interval % ckpt_every_n_eval == 0):
-                # Add architecture to model_args for checkpoint
-                checkpoint_model_args = model_args.copy()
-                checkpoint_model_args["architecture"] = architecture
-                
+                # Ensure all GNN parameters are saved with correct names
+                checkpoint_model_args = {
+                    "n_gnn_layers": model_args["n_gnn_layers"],
+                    "gnn_heads": model_args["gnn_heads"],
+                    "n_resnet_blocks": model_args["n_resnet_blocks"],
+                    "n_embd": model_args["n_embd"],
+                    "latent_embd": model_args["latent_embd"],
+                    "action_msg_feats": model_args["action_msg_feats"],
+                    "n_comm_rounds": model_args["n_comm_rounds"],
+                    "num_action_heads": model_args["num_action_heads"],
+                    "loss_weights": model_args["loss_weights"],
+                    "block_size": model_args["block_size"],
+                    "vocab_size": model_args["vocab_size"],
+                    "field_of_view_size": model_args["field_of_view_size"],
+                    "dropout": model_args["dropout"],
+                    "bias": model_args["bias"],
+                    "empty_token_code": model_args["empty_token_code"],
+                    "empty_connection_code": model_args["empty_connection_code"],
+                }
+
                 checkpoint = {
                     "model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
