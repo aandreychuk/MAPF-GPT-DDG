@@ -34,7 +34,6 @@ always_save_checkpoint = True  # if True, always save a checkpoint after each ev
 init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 
 gradient_accumulation_steps = 16  # used to simulate larger batch sizes
-batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 256
 # model
 n_encoder_layer = 2
@@ -107,7 +106,8 @@ if "architecture" not in config_keys:
 exec(open("gpt/configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
-train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes)
+batch_size = sum(batch_sizes)
+train_data = AggregatedMapfArrowDataset(train_data_files, device=device, batch_sizes=batch_sizes, field_of_view_size=field_of_view_size)
 
 # train_data = MapfArrowDataset(train_data_file, device=device, batch_size=batch_size // state_size)
 # val_data = MapfArrowDataset(valid_data_file, device=device, batch_size=batch_size // state_size)
@@ -230,7 +230,6 @@ model_args = dict(
     latent_embd = latent_embd,
     latent_tok_n = latent_tok_n,
     field_of_view_size = field_of_view_size,
-    max_num_neighbors = max_num_neighbors,
     empty_token_code = empty_token_code,
     num_action_heads = num_action_heads,
     loss_weights = loss_weights,
@@ -250,13 +249,13 @@ if init_from == "scratch":
     
     if use_gnn:
         # Convert DMM args to GNN args
+        # Check for GNN-specific names first, then fall back to old names for compatibility
         gnn_args = {
             "block_size": model_args.get("block_size", 128),
             "vocab_size": meta_vocab_size,
             "field_of_view_size": model_args.get("field_of_view_size", 121),
-            "max_num_neighbors": model_args.get("max_num_neighbors", 13),
-            "n_gnn_layers": model_args.get("n_encoder_layer", 2),  # Use encoder layers as GNN layers
-            "gnn_heads": model_args.get("n_head", 2),
+            "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
+            "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
             "n_embd": model_args.get("n_embd", 16),
             "latent_embd": model_args.get("latent_embd", 8),
             "dropout": model_args.get("dropout", 0.0),
@@ -293,7 +292,7 @@ elif init_from == "resume":
     # force these config attributes to be equal otherwise we can't even resume training
     if use_gnn:
         for k in ["action_msg_feats", "empty_connection_code", "n_comm_rounds",
-            "latent_embd", "field_of_view_size", "max_num_neighbors", "empty_token_code",
+            "latent_embd", "field_of_view_size", "empty_token_code",
             "n_embd", "block_size", "bias", "vocab_size", "n_gnn_layers", "gnn_heads", "n_resnet_blocks"]:
             if k in checkpoint_model_args:
                 model_args[k] = checkpoint_model_args[k]
@@ -302,7 +301,6 @@ elif init_from == "resume":
             "block_size": model_args.get("block_size", 128),
             "vocab_size": model_args.get("vocab_size", 97),
             "field_of_view_size": model_args.get("field_of_view_size", 121),
-            "max_num_neighbors": model_args.get("max_num_neighbors", 13),
             "n_gnn_layers": model_args.get("n_gnn_layers", model_args.get("n_encoder_layer", 2)),
             "gnn_heads": model_args.get("gnn_heads", model_args.get("n_head", 2)),
             "n_embd": model_args.get("n_embd", 16),

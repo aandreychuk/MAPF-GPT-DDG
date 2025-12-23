@@ -13,11 +13,12 @@ from torch.utils.data import Dataset
 
 
 class MapfArrowDataset(torch.utils.data.Dataset):
-    def __init__(self, folder_path, device, batch_size):
+    def __init__(self, folder_path, device, batch_size, field_of_view_size=None):
         self.all_data_files = self.file_paths = sorted(glob.glob(os.path.join(folder_path, "*.arrow")))
         self.device = device
         self.batch_size = batch_size
         self.dtype = torch.int8
+        self.field_of_view_size = field_of_view_size  # Store FOV size for slicing redundant tokens
 
         ddp_local_rank = os.environ.get("LOCAL_RANK")
         ddp_world_size = os.environ.get("WORLD_SIZE")
@@ -34,7 +35,9 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             self.file_paths = self.file_paths[start_index:end_index]
 
         # pre-allocate memory for the input and target tensors (same file size)
-        sample_input_tensors, sample_target_tensors, sample_agents_in_obs, sample_rel_coords = self._get_data_from_file(self.file_paths[0])
+        sample_input_tensors, sample_target_tensors, sample_agents_in_obs, sample_rel_coords = self._get_data_from_file(
+            self.file_paths[0], field_of_view_size=self.field_of_view_size
+        )
         self.input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
         self.target_tensors = torch.full(sample_target_tensors.shape, -1, dtype=self.dtype, device=self.device)
         self.agents_in_obs = torch.empty(sample_agents_in_obs.shape, dtype=self.dtype, device=self.device)
@@ -56,7 +59,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         self._next_file_ready = False
 
     @staticmethod
-    def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13):
+    def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13, field_of_view_size=None):
         with pa.memory_map(file_path) as source:
             table = pa.ipc.open_file(source).read_all()
             input_tensors_raw = table["input_tensors"].to_numpy(zero_copy_only=False)
@@ -69,6 +72,13 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             [[np.array(inner, dtype=np.int8) for inner in batch] for batch in input_tensors_raw],
             dtype=np.int8,
         )
+        
+        # Discard redundant tokens from FOV: keep only first field_of_view_size tokens
+        # If dataset has 128 FOV tokens and we want 121, slice to [:121]
+        if field_of_view_size is not None and input_tensors.shape[2] > field_of_view_size:
+            original_size = input_tensors.shape[2]
+            input_tensors = input_tensors[:, :, :field_of_view_size]
+            logger.debug(f"Sliced input_tensors from {original_size} to {field_of_view_size} tokens (removed {original_size - field_of_view_size} redundant tokens)")
 
         # gt_actions: List[timestep][agent][10] -> full action horizon per agent
         # Result shape: [num_timesteps, num_agents, horizon]
@@ -116,7 +126,9 @@ class MapfArrowDataset(torch.utils.data.Dataset):
     def load_and_transfer_data_file(self, filename, use_next_buffers=False):
         start_time = time.monotonic()
 
-        input_tensors, gt_actions, agents_in_obs, agents_rel_coords = self._get_data_from_file(filename)
+        input_tensors, gt_actions, agents_in_obs, agents_rel_coords = self._get_data_from_file(
+            filename, field_of_view_size=self.field_of_view_size
+        )
 
         if use_next_buffers:
             target_input = self.next_input_tensors

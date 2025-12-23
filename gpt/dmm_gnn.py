@@ -55,10 +55,7 @@ class SpatialEncoder(nn.Module):
         self.vocab_size = config.vocab_size
         self.n_embd = config.n_embd
         self.field_of_view_size = config.field_of_view_size
-        
-        # Convert sequence to spatial grid (11x11)
-        obs_radius = int(math.sqrt(self.field_of_view_size)) // 2  # e.g., 5 for 11x11
-        self.grid_size = 2 * obs_radius + 1  # 11
+        self.grid_size = int(math.sqrt(self.field_of_view_size))
         
         # Embedding for tokens
         self.token_embedding = nn.Embedding(self.vocab_size, self.n_embd)
@@ -91,35 +88,14 @@ class SpatialEncoder(nn.Module):
         Returns:
             latent: [B*C, latent_embd] encoded representation
         """
-        B_C, T = observations.shape
-        device = observations.device
+        B_C, _ = observations.shape
         
         # Embed tokens
         tok_emb = self.token_embedding(observations)  # [B*C, T, n_embd]
         
-        # Reshape to spatial grid (assuming T = field_of_view_size = 121 = 11*11)
-        # If T != field_of_view_size, we'll pad or truncate
-        if T == self.field_of_view_size:
-            # Reshape to [B*C, n_embd, 11, 11]
-            spatial = tok_emb.transpose(1, 2)  # [B*C, n_embd, T]
-            spatial = spatial.view(B_C, self.n_embd, self.grid_size, self.grid_size)
-        else:
-            # Handle variable sequence length: use adaptive pooling or padding
-            # For simplicity, use 1D conv then reshape
-            spatial = tok_emb.transpose(1, 2)  # [B*C, n_embd, T]
-            # Interpolate to grid size if needed
-            if T < self.field_of_view_size:
-                # Pad
-                spatial = F.pad(spatial, (0, self.field_of_view_size - T))
-            elif T > self.field_of_view_size:
-                # Truncate
-                spatial = spatial[:, :, :self.field_of_view_size]
-            # Reshape to grid
-            spatial = spatial.view(B_C, self.n_embd, self.grid_size, self.grid_size)
-        
-        # Initial convolution
-        spatial = self.initial_conv(spatial)
-        spatial = F.gelu(spatial)
+        # Reshape to [B*C, n_embd, 11, 11]
+        spatial = tok_emb.transpose(1, 2)  # [B*C, n_embd, T]
+        spatial = spatial.view(B_C, self.n_embd, self.grid_size, self.grid_size)
         
         # ResNet blocks for hierarchical features
         for resnet_block in self.resnet_blocks:
@@ -444,7 +420,6 @@ class DMMGNNConfig:
     block_size: int = 128
     vocab_size: int = 97
     field_of_view_size: int = 11*11
-    max_num_neighbors: int = 13
     
     # GNN-specific
     n_gnn_layers: int = 2  # Number of GNN layers in encoder
@@ -479,7 +454,6 @@ class DMMGNN(nn.Module):
         self.config = config
         self.n_comm_rounds = config.n_comm_rounds
         
-        self.max_num_neighbors = config.max_num_neighbors
         self.field_of_view_size = config.field_of_view_size
         self.block_size = config.block_size
         
@@ -595,17 +569,4 @@ class DMMGNN(nn.Module):
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
         return idx_next.squeeze()
-    
-    def encode(self, observations):
-        """Encode observations (same interface as DMM)."""
-        B, C, T = observations.shape
-        device = observations.device
-        
-        # For GNN, we need agent_chat_ids, so this is a simplified version
-        # In practice, you might want to pass dummy connections
-        dummy_connections = torch.zeros(B, C, self.max_num_neighbors, dtype=torch.long, device=device) - 1
-        
-        node_features = self.graph_encoder(observations, dummy_connections)
-        # Reshape to match DMM format [B, C, 1, latent_embd]
-        return node_features.view(B, C, 1, self.config.latent_embd)
 
