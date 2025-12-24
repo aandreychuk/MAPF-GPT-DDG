@@ -86,10 +86,10 @@ class LCMAPFInference:
                 do_sample=True,
                 dist_priorities=True
             )
-        state_size = len(positions)
-        self.observation_generator = ObservationGeneratorDirections(observations[0]['global_obstacles'].copy().astype(int).tolist(), self.cfg.context_size)
-        self.observation_generator.create_agents(positions, goals)
-        self.last_actions = [-1 for _ in range(len(observations))]
+        if self.observation_generator is None:
+            self.observation_generator = ObservationGeneratorDirections(observations[0]['global_obstacles'].copy().astype(int).tolist(), self.cfg.context_size)
+            self.observation_generator.create_agents(positions, goals)
+            self.last_actions = [-1 for _ in range(len(observations))]
         self.observation_generator.update_agents(positions, goals, self.last_actions)
         inputs = self.observation_generator.generate_observations()
         tensor_obs = torch.tensor(inputs, dtype=torch.long, device=self.cfg.device)
@@ -122,6 +122,7 @@ class LCMAPFInference:
     def reset_states(self):
         self.observation_generator = None
         self.torch_generator.manual_seed(0)
+        self.pibt_collision_shielding = None
 
 
 class CollisionsWrapper(Wrapper):
