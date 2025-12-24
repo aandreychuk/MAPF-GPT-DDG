@@ -14,10 +14,13 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from cppimport import import_hook
+from gpt.observation_generator_directions import ObservationGeneratorDirections
+
 def save_to_arrow(inputs, gt_actions, agents_in_obs, agents_rel_coords, filepath):
     # inputs: List[timestep][agent][int8] - [int8] is observation
     # gt_actions: List[timestep][agent][int8] - [int8] is list of actions (length 10)
-    # agents_in_obs: List[timestep][agent][int8] - [int8] is list of agents in observation (variable length)
+    # agents_in_obs: List[timestep][agent][int8] - [int8] is list of agents in observation (length = min(num_agents, context_size))
     # agents_rel_coords: List[timestep][agent][int8] - [int8] is list of relative coordinates (dx0,dy0,dx1,dy1,...)
     schema = pa.schema([
         ('input_tensors', pa.list_(pa.list_(pa.int8()))),
@@ -106,16 +109,8 @@ def get_data_from_file(file_path):
         seeds = table["seeds"].to_pylist()
     return gt_actions, grid, starts, targets, seeds
 
-def generate_observations(gt_actions, grid, starts, targets, observation_type='cost2go'):
-    if observation_type == 'directions':
-        from cppimport import import_hook
-        from gpt.observation_generator_directions import ObservationGeneratorDirections
-        observation_generator = ObservationGeneratorDirections(grid, 5, 128)
-    else:
-        from cppimport import import_hook
-        from gpt.observation_generator import ObservationGenerator, InputParameters
-        observation_generator = ObservationGenerator(grid, InputParameters(20, 13, 5, 256, 5, 5))
-
+def generate_observations(gt_actions, grid, starts, targets):
+    observation_generator = ObservationGeneratorDirections(grid, 121)
     observation_generator.create_agents(starts, targets)
     observation_generator.update_agents(starts, targets, [-1 for _ in range(len(starts))])
     # Accumulate per-timestep lists
@@ -141,17 +136,12 @@ def generate_observations(gt_actions, grid, starts, targets, observation_type='c
             timestep_actions.append(action_tuple)
         actions.append(timestep_actions)
         agents_in_obs.append(observation_generator.get_agents_ids_in_observations())
-        # Get relative coordinates (only available for directions observation)
-        if observation_type == 'directions':
-            agents_rel_coords.append(observation_generator.get_agents_relative_coords())
-        else:
-            # For cost2go, create empty placeholder (26 zeros per agent = 13 neighbors * 2 coords)
-            agents_rel_coords.append([[0] * 26 for _ in range(num_agents)])
+        agents_rel_coords.append(observation_generator.get_agents_relative_coords())
         positions = [[positions[j][0] + moves[gt_actions[i][j]][0], positions[j][1] + moves[gt_actions[i][j]][1]] for j in range(len(positions))]
         observation_generator.update_agents(positions, targets, gt_actions[i])
     return observations, actions, agents_in_obs, agents_rel_coords
 
-def run_worker(files, log_path, dataset_path, samples_per_file, worker_id, observation_type='cost2go'):
+def run_worker(files, log_path, dataset_path, samples_per_file, worker_id):
     # Buffers hold timesteps
     all_observations = []     # List[t][agent][...]
     all_actions = []          # List[t][agent][a0,a1,a2,...,a9] (10 actions)
@@ -162,7 +152,7 @@ def run_worker(files, log_path, dataset_path, samples_per_file, worker_id, obser
         file_path = os.path.join(log_path, file)
         gt_actions, grid, starts, targets, seeds = get_data_from_file(file_path)
         for i in range(len(gt_actions)):
-            observations, actions, agents_in_obs, agents_rel_coords = generate_observations(gt_actions[i], grid[i], starts[i], targets[i], observation_type)
+            observations, actions, agents_in_obs, agents_rel_coords = generate_observations(gt_actions[i], grid[i], starts[i], targets[i])
             # Append raw timesteps first; filter later when buffer big enough
             all_observations.extend(observations)
             all_actions.extend(actions)
@@ -193,13 +183,12 @@ def __main__():
     parser.add_argument('--dataset_path', type=str, default='dataset_mapf/random', help='Path to the dataset')
     parser.add_argument('--samples_per_file', type=int, default=1000, help='Number of samples per file')
     parser.add_argument('--workers', type=int, default=1, help='Number of workers')
-    parser.add_argument('--observation_type', type=str, default='cost2go', help='Observation type')
     args = parser.parse_args()
     file_path = args.log_path
     files = os.listdir(file_path)
     files_per_worker = len(files) // args.workers
     with Pool(args.workers) as p:
-        p.starmap(run_worker, [(files[i * files_per_worker:(i + 1) * files_per_worker], args.log_path, args.dataset_path, args.samples_per_file, i, args.observation_type) for i in range(args.workers)])
+        p.starmap(run_worker, [(files[i * files_per_worker:(i + 1) * files_per_worker], args.log_path, args.dataset_path, args.samples_per_file, i) for i in range(args.workers)])
     print("DONE")
 
 if __name__ == "__main__":

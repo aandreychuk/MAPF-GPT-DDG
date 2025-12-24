@@ -539,7 +539,7 @@ int main()
     grid[11][10] = 1;
     grid[11][11] = 1;
     
-    ObservationGenerator obs_gen(grid, 5, 128);
+    ObservationGenerator obs_gen(grid, 121);
     
     // Position agent very close to border to see out-of-bounds areas
     // Agent at (3,3) with radius 5 will see out-of-bounds on top and left sides
@@ -602,7 +602,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(observation_generator_directions, m)
 {
     py::class_<ObservationGenerator>(m, "ObservationGeneratorDirections", py::module_local())
-        .def(py::init<const std::vector<std::vector<int>> &, int, int>())
+        .def(py::init<const std::vector<std::vector<int>> &, int>())
         .def("create_agents", &ObservationGenerator::create_agents)
         .def("update_agents", &ObservationGenerator::update_agents)
         .def("generate_observations", &ObservationGenerator::generate_observations)

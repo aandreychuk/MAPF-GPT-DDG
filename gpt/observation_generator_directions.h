@@ -20,6 +20,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #endif
+#include <cmath>
 
 struct HashPair
 {
@@ -48,9 +49,10 @@ public:
     std::unordered_map<std::pair<int, int>, std::vector<std::vector<int8_t>>, HashPair> cost2go_cache;
     std::vector<std::vector<int>> agents_in_observation; // Cache for agent IDs visible to each agent
     std::vector<std::vector<int>> agents_rel_coords;     // Relative coordinates (dx, dy) for each neighbor, flattened
-    ObservationGenerator(const std::vector<std::vector<int>> &grid, int obs_radius, int context_size)
-        : grid(grid), obs_radius(obs_radius), context_size(context_size)
+    ObservationGenerator(const std::vector<std::vector<int>> &grid, int context_size)
+        : grid(grid), context_size(context_size)
     {
+        obs_radius = int(std::sqrt(context_size) - 1)/2;
         agents_locations = std::vector<std::vector<int>>(grid.size(), std::vector<int>(grid[0].size(), -1));
     }
     ~ObservationGenerator() {}
