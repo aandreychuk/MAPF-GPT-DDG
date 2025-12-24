@@ -423,7 +423,7 @@ class DMMGNNConfig:
     
     # GNN-specific
     n_gnn_layers: int = 2  # Number of GNN layers in encoder
-    gnn_heads: int = 4  # Number of attention heads in graph transformer
+    gnn_heads: int = 2  # Number of attention heads in graph transformer
     n_resnet_blocks: int = 2  # Number of ResNet blocks in spatial encoder
     
     # Shared with DMM
@@ -569,4 +569,10 @@ class DMMGNN(nn.Module):
         else:
             _, idx_next = torch.topk(probs, k=1, dim=-1)
         return idx_next.squeeze()
+    
+    @torch.no_grad()
+    def get_action_probs(self, obs, agent_chat_ids, agents_rel_coords=None):
+        """Get action logits for the given observations and agent connections."""
+        logits, _ = self(obs, agent_chat_ids, agents_rel_coords=agents_rel_coords)
+        return F.softmax(logits, dim=-1)
 

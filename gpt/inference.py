@@ -8,37 +8,21 @@ from pogema_toolbox.registry import ToolboxRegistry
 from pogema_toolbox.run_episode import run_episode
 from pydantic import Extra
 
-#from gpt.model import LCMAPF, Config
 from gpt.dmm_gnn import DMMGNN, DMMGNNConfig
-from gpt.dmm_comm import DMM, DMMConfig
 import cppimport.import_hook
-from gpt.observation_generator import InputParameters, ObservationGenerator
 from gpt.observation_generator_directions import ObservationGeneratorDirections
 from pogema import pogema_v0, AnimationMonitor, AnimationConfig
 from pogema.wrappers.metrics import RuntimeMetricWrapper, Wrapper
 from pogema_toolbox.create_env import MultiMapWrapper
-
+from gpt.cs_pibt import PIBTCollisionShielding
 
 class LCMAPFInferenceConfig(AlgoBase, extra=Extra.forbid):
     name: Literal["LC-MAPF"] = "LC-MAPF"
-    num_agents: int = 13
-    num_previous_actions: int = 5
-    cost2go_value_limit: int = 20
-    agents_radius: int = 5
-    cost2go_radius: int = 5
     path_to_weights: Optional[str] = "weights/ckpt.pt"
     device: str = "cuda"
-    context_size: int = 256
-    mask_actions_history: bool = False
-    mask_goal: bool = False
-    mask_cost2go: bool = False
-    mask_greed_action: bool = False
-    repo_id: str = ''
-    grid_step: int = 64
-    save_cost2go: bool = False
+    context_size: int = 121
     num_rounds: int = 2
-    observation_type = 'cost2go'
-    model_type: Optional[Literal["dmm", "gnn"]] = None  # None = auto-detect from checkpoint
+    use_cs_pibt: bool = True
 
 
 def strip_prefix_from_state_dict(state_dict, prefix="_orig_mod."):
@@ -58,23 +42,16 @@ def strip_prefix_from_state_dict(state_dict, prefix="_orig_mod."):
 class LCMAPFInference:
     def __init__(self, cfg: LCMAPFInferenceConfig):
         self.cfg: LCMAPFInferenceConfig = cfg
-        self.input_parameters = InputParameters(
-            cfg.cost2go_value_limit,
-            cfg.num_agents,
-            cfg.num_previous_actions,
-            cfg.context_size,
-            cfg.cost2go_radius,
-            cfg.agents_radius
-        )
         self.observation_generator = None
         self.last_actions = None
+        self.pibt_collision_shielding = None
         path_to_weights = Path(self.cfg.path_to_weights)
 
         if self.cfg.device in ['mps',
                                'cuda'] and not torch.cuda.is_available() if self.cfg.device == 'cuda' else not torch.backends.mps.is_available():
             ToolboxRegistry.warning(f'{self.cfg.device} is not available, using cpu instead!')
             self.cfg.device = 'cpu'
-
+  
         self.torch_generator = torch.Generator(device=self.cfg.device)
         self.torch_generator.manual_seed(0)
 
@@ -84,62 +61,15 @@ class LCMAPFInference:
        
         model_state_dict = strip_prefix_from_state_dict(checkpoint["model"])
         config_dict = checkpoint.get("model_args", {})
+        
+        # Override n_comm_rounds with the value from inference config
         config_dict["n_comm_rounds"] = cfg.num_rounds
         
-        # Determine model type: use config if provided, otherwise auto-detect from checkpoint
-        model_type = cfg.model_type
-        if model_type is None:
-            # Auto-detect: check if checkpoint has GNN-specific keys
-            has_gnn_keys = any("graph_encoder" in k or "graph_decoder" in k or "gnn_layers" in k 
-                              for k in model_state_dict.keys())
-            model_type = "gnn" if has_gnn_keys else "dmm"
-        
-        # Filter config_dict to only include valid parameters for the selected model type
-        if model_type == "gnn":
-            # Get valid field names from DMMGNNConfig
-            valid_fields = {f.name for f in fields(DMMGNNConfig)}
-            filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
-            
-            # Map DMM parameters to GNN parameters if needed (for backward compatibility)
-            # This handles checkpoints that were saved with DMM parameter names
-            if "gnn_heads" not in filtered_config:
-                # Try to get from n_head if available, otherwise infer from checkpoint weights
-                if "n_head" in config_dict:
-                    filtered_config["gnn_heads"] = config_dict["n_head"]
-                elif "gnn_heads" in config_dict:
-                    filtered_config["gnn_heads"] = config_dict["gnn_heads"]
-                else:
-                    # Try to infer from checkpoint weights (check first GNN layer)
-                    # Format: graph_encoder.gnn_layers.0.conv.lin_key.weight has shape [num_heads * out_channels, in_channels]
-                    # Since out_channels == in_channels == latent_embd in GraphTransformerLayer,
-                    # we can infer: num_heads = weight.shape[0] / weight.shape[1]
-                    for key in model_state_dict.keys():
-                        if "gnn_layers.0.conv.lin_key.weight" in key:
-                            weight_shape = model_state_dict[key].shape
-                            if len(weight_shape) == 2:
-                                # num_heads = (num_heads * out_channels) / in_channels
-                                # Since out_channels == in_channels, num_heads = weight_shape[0] / weight_shape[1]
-                                inferred_heads = weight_shape[0] // weight_shape[1]
-                                filtered_config["gnn_heads"] = inferred_heads
-                                break
-                    else:
-                        # Default fallback if we can't infer from weights
-                        filtered_config["gnn_heads"] = 3
-            if "n_gnn_layers" not in filtered_config:
-                # Try to get from n_encoder_layer if available
-                filtered_config["n_gnn_layers"] = config_dict.get("n_gnn_layers", config_dict.get("n_encoder_layer", 2))
-            if "n_resnet_blocks" not in filtered_config:
-                # Use default if not available
-                filtered_config["n_resnet_blocks"] = config_dict.get("n_resnet_blocks", 2)
-            
-            config = DMMGNNConfig(**filtered_config)
-            self.net = DMMGNN(config)
-        else:  # model_type == "dmm"
-            # Get valid field names from DMMConfig
-            valid_fields = {f.name for f in fields(DMMConfig)}
-            filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
-            config = DMMConfig(**filtered_config)
-            self.net = DMM(config)
+        # Filter to only include valid GNN config fields (DMMGNNConfig will use defaults for missing values)
+        valid_fields = {f.name for f in fields(DMMGNNConfig)}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+        config = DMMGNNConfig(**filtered_config)
+        self.net = DMMGNN(config)
         self.net.load_state_dict(model_state_dict, strict=False)
         self.net.to(self.cfg.device)
         self.net.eval()
@@ -147,50 +77,45 @@ class LCMAPFInference:
     def act(self, observations, custom_num_agents=None, infos=None):
         positions = [obs["global_xy"] for obs in observations]
         goals = [obs["global_target_xy"] for obs in observations]
-
+        if self.pibt_collision_shielding is None:
+            self.pibt_collision_shielding = PIBTCollisionShielding(
+                obstacles=observations[0]['global_obstacles'].copy().astype(int),
+                starts=positions,
+                goals=goals,
+                seed=0,
+                do_sample=True,
+                dist_priorities=True
+            )
         state_size = len(positions)
-        if self.observation_generator is None:
-            if self.cfg.observation_type == 'cost2go':
-                #import cppimport.import_hook
-                #from gpt.observation_generator import ObservationGenerator
-                self.observation_generator = ObservationGenerator(
-                    observations[0]["global_obstacles"].copy().astype(int).tolist(),
-                    self.input_parameters
-                )
-            else:
-                #import cppimport.import_hook
-                #from gpt.observation_generator_directions import ObservationGeneratorDirections
-                self.observation_generator = ObservationGeneratorDirections(
-                    observations[0]['global_obstacles'].copy().astype(int).tolist(), 
-                    5,  # obs_radius 
-                    self.cfg.context_size
-                )
-            self.observation_generator.create_agents(positions, goals)
-            self.last_actions = [-1 for _ in range(len(observations))]
+        self.observation_generator = ObservationGeneratorDirections(observations[0]['global_obstacles'].copy().astype(int).tolist(), self.cfg.context_size)
+        self.observation_generator.create_agents(positions, goals)
+        self.last_actions = [-1 for _ in range(len(observations))]
         self.observation_generator.update_agents(positions, goals, self.last_actions)
         inputs = self.observation_generator.generate_observations()
         tensor_obs = torch.tensor(inputs, dtype=torch.long, device=self.cfg.device)
         tensor_obs = tensor_obs[None, :, :]
-
         agent_chat_ids = self.observation_generator.get_agents_ids_in_observations()
         agent_chat_ids = torch.tensor(agent_chat_ids, dtype=torch.long, device=self.cfg.device)
         agent_chat_ids = agent_chat_ids[None, :, :]
 
         # Get relative coordinates for message-to-FOV alignment (Directions observation)
         agents_rel_coords = None
-        if self.cfg.observation_type != 'cost2go':
-            rel_coords = self.observation_generator.get_agents_relative_coords()
-            agents_rel_coords = torch.tensor(rel_coords, dtype=torch.long, device=self.cfg.device)
-            agents_rel_coords = agents_rel_coords[None, :, :]
+        rel_coords = self.observation_generator.get_agents_relative_coords()
+        agents_rel_coords = torch.tensor(rel_coords, dtype=torch.long, device=self.cfg.device)
+        agents_rel_coords = agents_rel_coords[None, :, :]
 
-        actions = torch.squeeze(self.net.act(
-            obs=tensor_obs, 
-            agent_chat_ids=agent_chat_ids,
-            agents_rel_coords=agents_rel_coords
-        )).tolist()
+        if self.cfg.use_cs_pibt:
+            action_probs = self.net.get_action_probs(tensor_obs, agent_chat_ids, agents_rel_coords)
+            actions = self.pibt_collision_shielding(action_probs)
+        else:
+            actions = torch.squeeze(self.net.act(
+                obs=tensor_obs, 
+                agent_chat_ids=agent_chat_ids,
+                agents_rel_coords=agents_rel_coords
+            )).tolist()
 
-        if not isinstance(actions, list):
-            actions = [actions]
+            if not isinstance(actions, list):
+                actions = [actions]
         self.last_actions = actions.copy()
         return actions
 
