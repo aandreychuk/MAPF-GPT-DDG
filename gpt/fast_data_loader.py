@@ -1,8 +1,9 @@
 import glob
 import os
 import time
-import threading
-from queue import Queue
+import multiprocessing
+from multiprocessing import Process, Queue, Lock, Manager
+from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
 import pyarrow as pa
@@ -10,6 +11,15 @@ import torch
 
 from loguru import logger
 from torch.utils.data import Dataset
+
+# Set multiprocessing start method for better compatibility with CUDA
+# 'spawn' is safer than 'fork' when using CUDA
+if hasattr(multiprocessing, 'set_start_method'):
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set, ignore
+        pass
 
 
 class MapfArrowDataset(torch.utils.data.Dataset):
@@ -52,11 +62,24 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         self.next_agents_in_obs = torch.empty(sample_agents_in_obs.shape, dtype=self.dtype, device=self.device)
         self.next_agents_rel_coords = torch.empty(sample_rel_coords.shape, dtype=self.dtype, device=self.device)
         
-        # Threading support for async loading
-        self._preload_thread = None
-        self._preload_queue = Queue(maxsize=1)  # Queue to signal when preload is complete
-        self._preload_lock = threading.Lock()
-        self._next_file_ready = False
+        # Multiprocessing support for async loading
+        # Use Manager for shared state that needs to be accessed across processes
+        self._manager = Manager()
+        self._preload_process = None
+        self._preload_queue = Queue(maxsize=1)  # Queue to signal when preload is complete (legacy, kept for compatibility)
+        self._preload_lock = self._manager.Lock()
+        self._field_of_view_size_shared = field_of_view_size  # Store for worker process
+        # Queues for worker process communication (initialized when needed)
+        self._preload_result_queue = None
+        self._preload_error_queue = None
+        self._preload_filename = None
+        # Store shapes and dtypes for shared memory allocation
+        self._sample_shapes_and_dtypes = [
+            (sample_input_tensors.shape, sample_input_tensors.dtype),
+            (sample_target_tensors.shape, sample_target_tensors.dtype),
+            (sample_agents_in_obs.shape, sample_agents_in_obs.dtype),
+            (sample_rel_coords.shape, sample_rel_coords.dtype),
+        ]
 
     @staticmethod
     def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13, field_of_view_size=None):
@@ -124,6 +147,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         return input_tensors, gt_actions, agents_in_obs, agents_rel_coords
 
     def load_and_transfer_data_file(self, filename, use_next_buffers=False):
+        """Load data from file and transfer to GPU. Can be called from main process or worker."""
         start_time = time.monotonic()
 
         input_tensors, gt_actions, agents_in_obs, agents_rel_coords = self._get_data_from_file(
@@ -149,25 +173,69 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         finish_time = time.monotonic() - start_time
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
         
+        # Note: use_next_buffers=True path is legacy and not used with multiprocessing implementation
         if use_next_buffers:
-            with self._preload_lock:
-                self._next_file_ready = True
-            self._preload_queue.put(True)  # Signal that preload is complete
+            self._preload_queue.put(True)  # Signal that preload is complete (legacy)
 
-    def _preload_next_file(self, filename):
-        """Load next file asynchronously into next_* buffers"""
+    @staticmethod
+    def _preload_worker(file_path, field_of_view_size, result_queue, error_queue, shapes_and_dtypes):
+        """Worker process function: loads file and processes numpy arrays, uses shared memory to avoid pickling overhead"""
+        shared_memories = []
         try:
-            self.load_and_transfer_data_file(filename, use_next_buffers=True)
+            start_time = time.monotonic()
+            
+            # Do CPU-bound work in worker process (file I/O and numpy operations)
+            input_tensors, gt_actions, agents_in_obs, agents_rel_coords = MapfArrowDataset._get_data_from_file(
+                file_path, field_of_view_size=field_of_view_size
+            )
+            
+            finish_time = time.monotonic() - start_time
+            logger.debug(f'Worker: Data from {file_path} processed in ~{round(finish_time, 5)}s')
+            
+            # Use shared memory to avoid pickling overhead
+            # Create shared memory blocks for each array
+            arrays_data = []
+            for arr, (shape, dtype) in zip(
+                [input_tensors, gt_actions, agents_in_obs, agents_rel_coords],
+                shapes_and_dtypes
+            ):
+                arr_bytes = arr.nbytes
+                shm = SharedMemory(create=True, size=arr_bytes)
+                shared_memories.append(shm)
+                
+                # Copy array data to shared memory
+                shared_arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+                shared_arr[:] = arr[:]
+                
+                arrays_data.append({
+                    'name': shm.name,
+                    'shape': shape,
+                    'dtype': dtype
+                })
+            
+            # Send shared memory info (lightweight, no data copying)
+            result_queue.put({
+                'arrays': arrays_data,
+                'success': True
+            })
+            
+            # Note: shared memory will be cleaned up by main process after reading
+            # Worker process keeps references to prevent premature cleanup
+            
         except Exception as e:
-            logger.error(f"Error preloading file {filename}: {e}")
-            with self._preload_lock:
-                self._next_file_ready = False
-            self._preload_queue.put(False)  # Signal error
+            logger.error(f"Error in preload worker for file {file_path}: {e}")
+            # Clean up shared memory on error
+            for shm in shared_memories:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except:
+                    pass
+            error_queue.put({'success': False, 'error': str(e)})
 
     def _start_preload(self, filename):
-        """Start async preloading of next file"""
-        with self._preload_lock:
-            self._next_file_ready = False
+        """Start async preloading of next file using multiprocessing"""
+        
         # Clear queue in case there's a stale signal
         while not self._preload_queue.empty():
             try:
@@ -175,26 +243,126 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             except:
                 break
         
-        if self._preload_thread is not None and self._preload_thread.is_alive():
-            self._preload_thread.join(timeout=0.1)  # Wait briefly for previous preload to finish
+        # Wait for previous process to finish
+        if self._preload_process is not None and self._preload_process.is_alive():
+            self._preload_process.join(timeout=0.1)
+            if self._preload_process.is_alive():
+                # Force terminate if still alive after timeout
+                self._preload_process.terminate()
+                self._preload_process.join(timeout=1.0)
         
-        self._preload_thread = threading.Thread(target=self._preload_next_file, args=(filename,), daemon=True)
-        self._preload_thread.start()
+        # Create queues for communication with worker process
+        result_queue = Queue()
+        error_queue = Queue()
+        
+        # Start worker process to do CPU-bound work
+        self._preload_process = Process(
+            target=self._preload_worker,
+            args=(filename, self._field_of_view_size_shared, result_queue, error_queue, self._sample_shapes_and_dtypes),
+            daemon=True
+        )
+        self._preload_process.start()
+        
+        # Store queues for later retrieval
+        self._preload_result_queue = result_queue
+        self._preload_error_queue = error_queue
+        self._preload_filename = filename
 
     def _swap_buffers(self):
         """Swap current and next buffers after next file is loaded"""
-        with self._preload_lock:
-            if not self._next_file_ready:
+        # Check if worker process has completed and get results
+        if self._preload_process is not None and not self._preload_process.is_alive():
+            # Check for errors first
+            if self._preload_error_queue is not None and not self._preload_error_queue.empty():
+                try:
+                    error_info = self._preload_error_queue.get_nowait()
+                    logger.warning(f"Preload failed for {self._preload_filename}: {error_info.get('error', 'Unknown error')}")
+                except:
+                    pass
+                # Clean up
+                self._cleanup_preload_process()
                 return False
             
-            # Swap buffers
-            self.input_tensors, self.next_input_tensors = self.next_input_tensors, self.input_tensors
-            self.target_tensors, self.next_target_tensors = self.next_target_tensors, self.target_tensors
-            self.agents_in_obs, self.next_agents_in_obs = self.next_agents_in_obs, self.agents_in_obs
-            self.agents_rel_coords, self.next_agents_rel_coords = self.next_agents_rel_coords, self.agents_rel_coords
-            
-            self._next_file_ready = False
-            return True
+            # Get results from worker process
+            if self._preload_result_queue is not None and not self._preload_result_queue.empty():
+                try:
+                    result = self._preload_result_queue.get_nowait()
+                    if result.get('success', False):
+                        # Read from shared memory (no pickling/unpickling overhead)
+                        shared_memories = []
+                        try:
+                            # Read arrays directly from shared memory into torch tensors
+                            # This avoids creating intermediate numpy copies
+                            arr_infos = result['arrays']
+                            
+                            # Create numpy views of shared memory and convert directly to torch
+                            shm0 = SharedMemory(name=arr_infos[0]['name'])
+                            shared_memories.append(shm0)
+                            arr0 = np.ndarray(arr_infos[0]['shape'], dtype=arr_infos[0]['dtype'], buffer=shm0.buf)
+                            self.next_input_tensors.copy_(
+                                torch.from_numpy(arr0).to(dtype=self.dtype), 
+                                non_blocking=True
+                            )
+                            
+                            shm1 = SharedMemory(name=arr_infos[1]['name'])
+                            shared_memories.append(shm1)
+                            arr1 = np.ndarray(arr_infos[1]['shape'], dtype=arr_infos[1]['dtype'], buffer=shm1.buf)
+                            self.next_target_tensors.copy_(
+                                torch.from_numpy(arr1).to(dtype=self.dtype), 
+                                non_blocking=True
+                            )
+                            
+                            shm2 = SharedMemory(name=arr_infos[2]['name'])
+                            shared_memories.append(shm2)
+                            arr2 = np.ndarray(arr_infos[2]['shape'], dtype=arr_infos[2]['dtype'], buffer=shm2.buf)
+                            self.next_agents_in_obs.copy_(
+                                torch.from_numpy(arr2).to(dtype=self.dtype), 
+                                non_blocking=True
+                            )
+                            
+                            shm3 = SharedMemory(name=arr_infos[3]['name'])
+                            shared_memories.append(shm3)
+                            arr3 = np.ndarray(arr_infos[3]['shape'], dtype=arr_infos[3]['dtype'], buffer=shm3.buf)
+                            self.next_agents_rel_coords.copy_(
+                                torch.from_numpy(arr3).to(dtype=self.dtype), 
+                                non_blocking=True
+                            )
+                        finally:
+                            # Clean up shared memory immediately after reading
+                            for shm in shared_memories:
+                                try:
+                                    shm.close()
+                                    shm.unlink()
+                                except:
+                                    pass
+                        
+                        # Swap buffers
+                        self.input_tensors, self.next_input_tensors = self.next_input_tensors, self.input_tensors
+                        self.target_tensors, self.next_target_tensors = self.next_target_tensors, self.target_tensors
+                        self.agents_in_obs, self.next_agents_in_obs = self.next_agents_in_obs, self.agents_in_obs
+                        self.agents_rel_coords, self.next_agents_rel_coords = self.next_agents_rel_coords, self.agents_rel_coords
+                        
+                        # Clean up process
+                        self._cleanup_preload_process()
+                        
+                        return True
+                except Exception as e:
+                    logger.warning(f"Error retrieving preload results: {e}")
+                    self._cleanup_preload_process()
+                    return False
+        
+        return False
+    
+    def _cleanup_preload_process(self):
+        """Clean up preload process and queues"""
+        if self._preload_process is not None:
+            if self._preload_process.is_alive():
+                self._preload_process.terminate()
+            self._preload_process.join(timeout=1.0)
+            self._preload_process = None
+        self._preload_result_queue = None
+        self._preload_error_queue = None
+        self._preload_filename = None
 
     def __iter__(self):
         while True:
@@ -226,28 +394,33 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                     # If not ready yet, wait for it (but this is non-blocking for training
                     # since we're done with current file anyway)
                     if batch_idx == num_batches - 1 and len(self.file_paths) > 1:
-                        # Check if preload is already complete
-                        with self._preload_lock:
-                            is_ready = self._next_file_ready
-                        
-                        if not is_ready:
-                            # Wait for preload to finish (with timeout to avoid infinite wait)
-                            try:
-                                result = self._preload_queue.get(timeout=30.0)  # 30 second timeout
-                                if not result:
-                                    logger.warning(f"Preload failed for {next_file_path}, will load synchronously")
-                            except:
+                        # Wait for preload process to finish (with timeout)
+                        if self._preload_process is not None:
+                            self._preload_process.join(timeout=30.0)  # 30 second timeout
+                            
+                            if self._preload_process.is_alive():
                                 logger.warning(f"Preload timeout for {next_file_path}, will load synchronously")
-                        
-                        # Ensure thread has finished
-                        if self._preload_thread is not None:
-                            self._preload_thread.join(timeout=1.0)
+                                self._preload_process.terminate()
+                                self._preload_process.join(timeout=1.0)
+                                self._preload_process = None
+                            else:
+                                # Process finished, try to swap buffers
+                                self._swap_buffers()
 
     def get_shard_size(self):
         return len(self.input_tensors) * len(self.file_paths)
 
     def get_full_dataset_size(self):
         return len(self.input_tensors) * len(self.all_data_files)
+    
+    def __del__(self):
+        """Cleanup on deletion"""
+        try:
+            self._cleanup_preload_process()
+            if hasattr(self, '_manager'):
+                self._manager.shutdown()
+        except:
+            pass  # Ignore errors during cleanup
 
 
 def main():
