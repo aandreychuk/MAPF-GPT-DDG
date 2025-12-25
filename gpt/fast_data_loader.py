@@ -67,20 +67,25 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         logger.info(
             f"Single file tensor size: {self.input_tensors.numel() * self.input_tensors.element_size() / 1e9:.4f} GB")
         
-        # Pre-allocated buffers for async loading of next file
+        # Pre-allocated buffers for double buffering (current and next only)
+        # Next buffer: preloaded file ready to swap when current finishes
         self.next_input_tensors = torch.empty(sample_input_tensors.shape, dtype=self.dtype, device=self.device)
         self.next_target_tensors = torch.full(sample_target_tensors.shape, -1, dtype=self.dtype, device=self.device)
         self.next_agents_in_obs = torch.empty(sample_agents_in_obs.shape, dtype=self.dtype, device=self.device)
         self.next_agents_rel_coords = torch.empty(sample_rel_coords.shape, dtype=self.dtype, device=self.device)
         
-        # Preload state (managed by coordinator if available)
-        self._preload_future = None  # Future from coordinator
+        # Preload state for next file (managed by coordinator if available)
+        self._preload_future = None  # Future from coordinator for next file
         self._preload_result_queue = None
         self._preload_error_queue = None
         self._preload_filename = None
+        
         # Track batch progress for priority calculation
         self._current_batch_idx = 0
         self._total_batches_in_file = 0
+        
+        # Track if next buffer is ready
+        self._next_ready = False  # True when next file is loaded and ready
 
     @staticmethod
     def _get_data_from_file(file_path, shuffle_data=True, max_num_neighbors=13, field_of_view_size=None):
@@ -167,7 +172,12 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         logger.debug(f'Data from {filename} for {self.device} device prepared in ~{round(finish_time, 5)}s')
     
     def _start_preload(self, filename):
-        """Start async preloading of next file using centralized coordinator with priority"""
+        """
+        Start async preloading of next file using centralized coordinator with priority.
+        
+        Args:
+            filename: Path to file to preload into next buffer
+        """
         # Prevent duplicate preload requests for the same file
         if self._preload_filename == filename and self._preload_future is not None:
             # Already preloading this file, just update priority if needed
@@ -181,7 +191,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             try:
                 self._preload_future.result(timeout=0.1)
             except:
-                pass  # Timeout or error, will be handled in _swap_buffers
+                pass  # Timeout or error, will be handled in _check_and_load_next_buffer
         
         # Create queues for communication with coordinator worker
         self._preload_result_queue = ThreadQueue()
@@ -240,8 +250,14 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             logger.error(f"Error in preload worker thread for file {file_path}: {e}")
             error_queue.put({'success': False, 'error': str(e)})
 
-    def _swap_buffers(self):
-        """Swap current and next buffers after next file is loaded"""
+    def _check_and_load_next_buffer(self):
+        """
+        Check if next file preload is complete and load it into next buffer.
+        Returns True if buffer was loaded, False otherwise.
+        """
+        if self._next_ready:
+            return True  # Already loaded
+        
         # Check if worker has completed
         if self._preload_future is not None and self._preload_future.done():
             # Check for errors first
@@ -260,10 +276,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                 try:
                     result = self._preload_result_queue.get_nowait()
                     if result.get('success', False):
-                        # Transfer numpy arrays directly to existing GPU buffers (no intermediate tensor allocation)
-                        # Use torch.from_numpy() which shares memory with numpy array (zero-copy on CPU if contiguous)
-                        # Then copy to existing GPU buffer (reuses GPU memory, no allocation)
-                        # Since numpy arrays are already int8, torch.from_numpy() creates int8 tensor directly
+                        # Transfer numpy arrays directly to existing GPU buffers
                         self.next_input_tensors.copy_(
                             torch.from_numpy(result['input_tensors']),
                             non_blocking=True
@@ -281,15 +294,8 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                             non_blocking=True
                         )
                         
-                        # Swap buffers
-                        self.input_tensors, self.next_input_tensors = self.next_input_tensors, self.input_tensors
-                        self.target_tensors, self.next_target_tensors = self.next_target_tensors, self.target_tensors
-                        self.agents_in_obs, self.next_agents_in_obs = self.next_agents_in_obs, self.agents_in_obs
-                        self.agents_rel_coords, self.next_agents_rel_coords = self.next_agents_rel_coords, self.agents_rel_coords
-                        
-                        # Clean up worker
+                        self._next_ready = True
                         self._cleanup_preload_worker()
-                        
                         return True
                 except Exception as e:
                     logger.warning(f"Error retrieving preload results: {e}")
@@ -298,8 +304,28 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         
         return False
     
+    def _swap_buffers(self):
+        """
+        Swap current and next buffers (double buffering).
+        After swap, next buffer is empty and ready for new preload.
+        Returns True if swap was successful, False otherwise.
+        """
+        # Check if next buffer is ready
+        if self._check_and_load_next_buffer():
+            # Swap current and next buffers
+            self.input_tensors, self.next_input_tensors = self.next_input_tensors, self.input_tensors
+            self.target_tensors, self.next_target_tensors = self.next_target_tensors, self.target_tensors
+            self.agents_in_obs, self.next_agents_in_obs = self.next_agents_in_obs, self.agents_in_obs
+            self.agents_rel_coords, self.next_agents_rel_coords = self.next_agents_rel_coords, self.agents_rel_coords
+            
+            # Mark next as not ready (it's now current, and the old current is now next but empty)
+            self._next_ready = False
+            return True
+        
+        return False
+    
     def _cleanup_preload_worker(self):
-        """Clean up preload worker and queues"""
+        """Clean up preload worker and queues for next file"""
         if self._preload_future is not None:
             # Future cleanup - check for exceptions but don't wait
             try:
@@ -319,21 +345,25 @@ class MapfArrowDataset(torch.utils.data.Dataset):
             for file_idx, file_path in enumerate(self.file_paths):
                 # Check if we have a preloaded file ready (works for wrap-around too)
                 if self._swap_buffers():
-                    # Successfully swapped, next file was already loaded
-                    pass
+                    # Successfully swapped, next file was already loaded and is now current
+                    # After swap, we're effectively on file_idx+1, so next file is file_idx+2
+                    next_file_idx = (file_idx + 2) % len(self.file_paths)
+                    if len(self.file_paths) > 1:
+                        next_file_path = self.file_paths[next_file_idx]
+                        self._start_preload(next_file_path)
                 else:
                     # Load current file synchronously (first iteration or preload didn't complete)
                     self.load_and_transfer_data_file(file_path)
+                    
+                    # Start preloading next file immediately after loading current
+                    next_file_idx = (file_idx + 1) % len(self.file_paths)
+                    if len(self.file_paths) > 1:
+                        next_file_path = self.file_paths[next_file_idx]
+                        self._start_preload(next_file_path)
                 
                 # Calculate total batches for this file
                 self._total_batches_in_file = (len(self.input_tensors) + self.batch_size - 1) // self.batch_size
                 self._current_batch_idx = 0
-                
-                # Start preloading next file asynchronously (if not the last file)
-                next_file_idx = (file_idx + 1) % len(self.file_paths)
-                if len(self.file_paths) > 1:  # Only preload if there are multiple files
-                    next_file_path = self.file_paths[next_file_idx]
-                    self._start_preload(next_file_path)
                 
                 # Yield batches from current file
                 for batch_idx in range(self._total_batches_in_file):
@@ -346,26 +376,24 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                     
                     # Update priority periodically (every 10 batches) to avoid overhead
                     # Loaders closer to finishing get higher priority
-                    if self.preload_coordinator is not None and self._preload_filename is not None:
+                    if self.preload_coordinator is not None:
                         # Only update priority periodically to avoid lock contention
                         if batch_idx % 10 == 0 or batch_idx == self._total_batches_in_file - 1:
                             batches_remaining = self._total_batches_in_file - batch_idx - 1
                             if batches_remaining >= 0:
                                 self.preload_coordinator.update_priority(self.loader_id, batches_remaining)
                     
-                    # On the last batch of current file, check if preload is ready
-                    # If not ready yet, wait for it (but this is non-blocking for training
-                    # since we're done with current file anyway)
+                    # On the last batch of current file, ensure next buffer is ready
                     if batch_idx == self._total_batches_in_file - 1 and len(self.file_paths) > 1:
-                        # Wait for preload worker to finish (with timeout)
-                        if self._preload_future is not None:
-                            try:
-                                self._preload_future.result(timeout=30.0)  # 30 second timeout
-                                # Worker finished, try to swap buffers
-                                self._swap_buffers()
-                            except Exception as e:
-                                logger.warning(f"Preload timeout/error for {next_file_path}: {e}, will load synchronously")
-                                self._preload_future = None
+                        # Check if next buffer is ready (with timeout)
+                        if not self._next_ready:
+                            if self._preload_future is not None:
+                                try:
+                                    self._preload_future.result(timeout=30.0)  # 30 second timeout
+                                    self._check_and_load_next_buffer()
+                                except Exception as e:
+                                    logger.warning(f"Preload timeout/error for {next_file_path}: {e}, will load synchronously")
+                                    self._cleanup_preload_worker()
 
     def get_shard_size(self):
         return len(self.input_tensors) * len(self.file_paths)

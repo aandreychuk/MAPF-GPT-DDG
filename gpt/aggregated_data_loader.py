@@ -21,7 +21,6 @@ class PreloadCoordinator:
         self.pending_preloads = {}  # loader_id -> Future
         self.pending_requests = {}  # loader_id -> (priority, request_info)
         self.active_preloads = set()  # loader_ids currently being preloaded
-        self.active_files = {}  # file_path -> loader_id (track which file is being preloaded by which loader)
         self.lock = threading.Lock()
         self._load_file_func = None  # Will be set by the dataset
         self.max_concurrent_io = max_concurrent_io
@@ -47,18 +46,6 @@ class PreloadCoordinator:
         Returns the Future object for tracking completion.
         """
         with self.lock:
-            # Check if this file is already being preloaded by another loader
-            if file_path in self.active_files:
-                other_loader_id = self.active_files[file_path]
-                if other_loader_id != loader_id:
-                    # Another loader is already preloading this file
-                    # Don't start duplicate preload, but store the request in case the other one fails
-                    self.pending_requests[loader_id] = (
-                        priority,
-                        (loader_id, file_path, field_of_view_size, result_queue, error_queue)
-                    )
-                    return None  # Will be started later if the other preload completes
-            
             # Cancel existing preload for this loader if any
             if loader_id in self.pending_preloads:
                 old_future = self.pending_preloads[loader_id]
@@ -66,10 +53,6 @@ class PreloadCoordinator:
                     old_future.cancel()
                 del self.pending_preloads[loader_id]
                 self.active_preloads.discard(loader_id)
-                # Remove from active_files if this loader was preloading something
-                for path, lid in list(self.active_files.items()):
-                    if lid == loader_id:
-                        del self.active_files[path]
             
             # Store request with priority
             self.pending_requests[loader_id] = (
@@ -103,13 +86,6 @@ class PreloadCoordinator:
                 # Start this preload
                 loader_id, file_path, field_of_view_size, result_queue, error_queue = request_info
                 
-                # Check again if file is already being preloaded (double-check after lock)
-                if file_path in self.active_files:
-                    other_loader_id = self.active_files[file_path]
-                    if other_loader_id != loader_id:
-                        # Skip this request - another loader is already preloading this file
-                        continue
-                
                 future = self.executor.submit(
                     self._preload_worker,
                     file_path,
@@ -119,7 +95,6 @@ class PreloadCoordinator:
                 )
                 self.pending_preloads[loader_id] = future
                 self.active_preloads.add(loader_id)
-                self.active_files[file_path] = loader_id  # Track which loader is preloading this file
                 del self.pending_requests[loader_id]
     
     def update_priority(self, loader_id, new_priority):
@@ -150,7 +125,6 @@ class PreloadCoordinator:
             )
             
             finish_time = time.monotonic() - start_time
-            # Include thread ID to help identify duplicates
             thread_id = threading.current_thread().ident
             logger.debug(f'Coordinator worker (thread {thread_id}): Data from {os.path.basename(file_path)} processed in ~{round(finish_time, 5)}s')
             
@@ -177,10 +151,6 @@ class PreloadCoordinator:
         for loader_id in completed:
             del self.pending_preloads[loader_id]
             self.active_preloads.discard(loader_id)
-            # Remove from active_files
-            for path, lid in list(self.active_files.items()):
-                if lid == loader_id:
-                    del self.active_files[path]
         
         # After cleanup, try to start more pending requests
         if completed:
@@ -196,10 +166,6 @@ class PreloadCoordinator:
                     future.cancel()
                 del self.pending_preloads[loader_id]
                 self.active_preloads.discard(loader_id)
-                # Remove from active_files
-                for path, lid in list(self.active_files.items()):
-                    if lid == loader_id:
-                        del self.active_files[path]
             
             # Remove pending request if any
             if loader_id in self.pending_requests:
@@ -214,7 +180,6 @@ class PreloadCoordinator:
             self.pending_preloads.clear()
             self.pending_requests.clear()
             self.active_preloads.clear()
-            self.active_files.clear()
         self.executor.shutdown(wait=False)
 
 
