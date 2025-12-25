@@ -2,7 +2,7 @@ import glob
 import os
 import time
 import multiprocessing
-from multiprocessing import Process, Queue, Lock, Manager
+from multiprocessing import Process, Queue
 from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
@@ -13,12 +13,19 @@ from loguru import logger
 from torch.utils.data import Dataset
 
 # Set multiprocessing start method for better compatibility with CUDA
-# 'spawn' is safer than 'fork' when using CUDA
-if hasattr(multiprocessing, 'set_start_method'):
+# Only set if not already set and not running under torchrun/DDP
+# torchrun/DDP manages the start method, so we shouldn't override it
+if hasattr(multiprocessing, 'get_start_method'):
     try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # Already set, ignore
+        # Check if we're in a DDP context (torchrun sets these env vars)
+        is_ddp = os.environ.get('WORLD_SIZE') is not None or os.environ.get('RANK') is not None
+        if not is_ddp:
+            current_method = multiprocessing.get_start_method(allow_none=True)
+            if current_method is None:
+                # Only set if not already set and not in DDP context
+                multiprocessing.set_start_method('spawn', force=False)
+    except (RuntimeError, ValueError):
+        # Already set or not available, ignore
         pass
 
 
@@ -63,11 +70,10 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         self.next_agents_rel_coords = torch.empty(sample_rel_coords.shape, dtype=self.dtype, device=self.device)
         
         # Multiprocessing support for async loading
-        # Use Manager for shared state that needs to be accessed across processes
-        self._manager = Manager()
+        # Note: We don't use Manager() to avoid conflicts with torchrun/DDP
+        # Worker processes communicate via Queue and SharedMemory only
         self._preload_process = None
         self._preload_queue = Queue(maxsize=1)  # Queue to signal when preload is complete (legacy, kept for compatibility)
-        self._preload_lock = self._manager.Lock()
         self._field_of_view_size_shared = field_of_view_size  # Store for worker process
         # Queues for worker process communication (initialized when needed)
         self._preload_result_queue = None
@@ -417,8 +423,6 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         """Cleanup on deletion"""
         try:
             self._cleanup_preload_process()
-            if hasattr(self, '_manager'):
-                self._manager.shutdown()
         except:
             pass  # Ignore errors during cleanup
 
