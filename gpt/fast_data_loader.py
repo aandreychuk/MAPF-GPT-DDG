@@ -32,7 +32,17 @@ def _get_shared_io_executor():
 
 class MapfArrowDataset(torch.utils.data.Dataset):
     def __init__(self, folder_path, device, batch_size, field_of_view_size=None, 
-                 preload_coordinator=None, loader_id=None):
+                 preload_coordinator=None, loader_id=None, batch_start_offset=0.0):
+        """
+        Args:
+            folder_path: Path to folder containing .arrow files
+            device: Device to load data onto
+            batch_size: Batch size for this dataset
+            field_of_view_size: Optional FOV size for token slicing
+            preload_coordinator: Optional PreloadCoordinator for I/O coordination
+            loader_id: Unique identifier for this loader
+            batch_start_offset: Fraction (0.0-1.0) to skip batches in first file for desynchronization
+        """
         self.all_data_files = self.file_paths = sorted(glob.glob(os.path.join(folder_path, "*.arrow")))
         self.device = device
         self.batch_size = batch_size
@@ -40,6 +50,7 @@ class MapfArrowDataset(torch.utils.data.Dataset):
         self.field_of_view_size = field_of_view_size  # Store FOV size for slicing redundant tokens
         self.preload_coordinator = preload_coordinator
         self.loader_id = loader_id if loader_id is not None else id(self)  # Unique ID for this loader
+        self.batch_start_offset = batch_start_offset  # Fraction to skip batches in first file
 
         ddp_local_rank = os.environ.get("LOCAL_RANK")
         ddp_world_size = os.environ.get("WORLD_SIZE")
@@ -363,10 +374,18 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                 
                 # Calculate total batches for this file
                 self._total_batches_in_file = (len(self.input_tensors) + self.batch_size - 1) // self.batch_size
-                self._current_batch_idx = 0
                 
-                # Yield batches from current file
-                for batch_idx in range(self._total_batches_in_file):
+                # For the first file only, skip batches based on batch_start_offset to desynchronize loaders
+                start_batch_idx = 0
+                if file_idx == 0 and self.batch_start_offset > 0.0:
+                    start_batch_idx = int(self._total_batches_in_file * self.batch_start_offset)
+                    logger.debug(f"Loader {self.loader_id}: Skipping first {start_batch_idx}/{self._total_batches_in_file} batches "
+                               f"(offset {self.batch_start_offset:.3f}) in first file")
+                
+                self._current_batch_idx = start_batch_idx
+                
+                # Yield batches from current file (starting from start_batch_idx)
+                for batch_idx in range(start_batch_idx, self._total_batches_in_file):
                     self._current_batch_idx = batch_idx
                     i = batch_idx * self.batch_size
                     yield (self.input_tensors[i:i + self.batch_size], 

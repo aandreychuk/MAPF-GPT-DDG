@@ -207,14 +207,22 @@ class AggregatedMapfArrowDataset(Dataset):
         self.batch_sizes = batch_sizes
 
         # Create datasets and pass the coordinator
+        # Apply batch start offsets to desynchronize loaders and prevent simultaneous file loading
+        # Each loader skips a fraction of batches in the first file, spreading out file transitions
+        num_loaders = len(folder_paths)
         for idx, (folder_path, batch_size) in enumerate(zip(folder_paths, batch_sizes)):
+            # Calculate offset: loader 0 skips 0, loader 1 skips 1/N, loader 2 skips 2/N, etc.
+            # This spreads out file transitions across time
+            batch_start_offset = idx / num_loaders if num_loaders > 1 else 0.0
+            
             dataset = MapfArrowDataset(
                 folder_path, 
                 device, 
                 batch_size, 
                 field_of_view_size=field_of_view_size,
                 preload_coordinator=self.preload_coordinator,
-                loader_id=idx
+                loader_id=idx,
+                batch_start_offset=batch_start_offset
             )
             self.datasets.append(dataset)
 
