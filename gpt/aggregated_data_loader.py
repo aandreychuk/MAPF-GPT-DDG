@@ -1,12 +1,185 @@
 from loguru import logger
 import torch
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from torch.utils.data import Dataset
 from gpt.fast_data_loader import MapfArrowDataset
 
 
+class PreloadCoordinator:
+    """
+    Centralized coordinator for managing preload requests across multiple loaders.
+    Prevents I/O saturation by limiting concurrent file operations and prioritizing
+    loaders that are closer to needing their next file (based on batch progress).
+    """
+    def __init__(self, max_concurrent_io=2):
+        self.executor = ThreadPoolExecutor(
+            max_workers=max_concurrent_io,
+            thread_name_prefix="DataLoaderIO"
+        )
+        self.pending_preloads = {}  # loader_id -> Future
+        self.pending_requests = {}  # loader_id -> (priority, request_info)
+        self.active_preloads = set()  # loader_ids currently being preloaded
+        self.lock = threading.Lock()
+        self._load_file_func = None  # Will be set by the dataset
+        self.max_concurrent_io = max_concurrent_io
+    
+    def register_load_function(self, load_func):
+        """Register the function to use for loading files"""
+        self._load_file_func = load_func
+    
+    def request_preload(self, loader_id, file_path, field_of_view_size, result_queue, error_queue, priority=0):
+        """
+        Request a preload for a specific loader with a priority.
+        Lower priority value = higher priority (will be preloaded first).
+        Priority should be based on batches remaining in current file.
+        
+        Args:
+            loader_id: Unique identifier for the loader
+            file_path: Path to file to preload
+            field_of_view_size: FOV size parameter
+            result_queue: Queue to put results in
+            error_queue: Queue to put errors in
+            priority: Priority value (lower = higher priority, based on batches remaining)
+        
+        Returns the Future object for tracking completion.
+        """
+        with self.lock:
+            # Cancel existing preload for this loader if any
+            if loader_id in self.pending_preloads:
+                old_future = self.pending_preloads[loader_id]
+                if not old_future.done():
+                    old_future.cancel()
+                del self.pending_preloads[loader_id]
+                self.active_preloads.discard(loader_id)
+            
+            # Store request with priority
+            self.pending_requests[loader_id] = (
+                priority,
+                (loader_id, file_path, field_of_view_size, result_queue, error_queue)
+            )
+            
+            # Try to start preloads (will prioritize based on priority)
+            self._process_pending_requests()
+            
+            # Return future if it was started, otherwise None (will be started later)
+            return self.pending_preloads.get(loader_id)
+    
+    def _process_pending_requests(self):
+        """Process pending requests, starting highest priority ones up to max_concurrent_io limit"""
+        # Clean up completed preloads first
+        self._cleanup_completed()
+        
+        # Sort pending requests by priority (lower priority value = higher priority)
+        sorted_requests = sorted(
+            self.pending_requests.items(),
+            key=lambda x: x[1][0]  # Sort by priority
+        )
+        
+        # Start preloads up to the limit
+        for loader_id, (priority, request_info) in sorted_requests:
+            if len(self.active_preloads) >= self.max_concurrent_io:
+                break  # Reached limit
+            
+            if loader_id not in self.active_preloads:
+                # Start this preload
+                loader_id, file_path, field_of_view_size, result_queue, error_queue = request_info
+                future = self.executor.submit(
+                    self._preload_worker,
+                    file_path,
+                    field_of_view_size,
+                    result_queue,
+                    error_queue
+                )
+                self.pending_preloads[loader_id] = future
+                self.active_preloads.add(loader_id)
+                del self.pending_requests[loader_id]
+    
+    def update_priority(self, loader_id, new_priority):
+        """
+        Update the priority of a pending preload request.
+        If the preload is already active, this has no effect.
+        """
+        with self.lock:
+            if loader_id in self.pending_requests:
+                # Update priority and re-sort
+                old_priority, request_info = self.pending_requests[loader_id]
+                self.pending_requests[loader_id] = (new_priority, request_info)
+                # Re-process to potentially start higher priority requests
+                self._process_pending_requests()
+    
+    def _preload_worker(self, file_path, field_of_view_size, result_queue, error_queue):
+        """Worker function that loads file and processes numpy arrays"""
+        try:
+            import time
+            start_time = time.monotonic()
+            
+            # Use the registered load function
+            input_tensors, gt_actions, agents_in_obs, agents_rel_coords = self._load_file_func(
+                file_path, field_of_view_size=field_of_view_size
+            )
+            
+            finish_time = time.monotonic() - start_time
+            logger.debug(f'Coordinator worker: Data from {file_path} processed in ~{round(finish_time, 5)}s')
+            
+            # Put numpy arrays directly in queue
+            result_queue.put({
+                'input_tensors': input_tensors,
+                'gt_actions': gt_actions,
+                'agents_in_obs': agents_in_obs,
+                'agents_rel_coords': agents_rel_coords,
+                'success': True
+            })
+            
+        except Exception as e:
+            logger.error(f"Error in coordinator preload worker for file {file_path}: {e}")
+            error_queue.put({'success': False, 'error': str(e)})
+    
+    def _cleanup_completed(self):
+        """Remove completed futures from tracking and start next pending requests"""
+        completed = []
+        for loader_id, future in self.pending_preloads.items():
+            if future.done():
+                completed.append(loader_id)
+        
+        for loader_id in completed:
+            del self.pending_preloads[loader_id]
+            self.active_preloads.discard(loader_id)
+        
+        # After cleanup, try to start more pending requests
+        if completed:
+            self._process_pending_requests()
+    
+    def cancel_preload(self, loader_id):
+        """Cancel a pending preload for a specific loader"""
+        with self.lock:
+            # Cancel active preload if any
+            if loader_id in self.pending_preloads:
+                future = self.pending_preloads[loader_id]
+                if not future.done():
+                    future.cancel()
+                del self.pending_preloads[loader_id]
+                self.active_preloads.discard(loader_id)
+            
+            # Remove pending request if any
+            if loader_id in self.pending_requests:
+                del self.pending_requests[loader_id]
+    
+    def shutdown(self):
+        """Shutdown the executor and cancel all pending preloads"""
+        with self.lock:
+            for future in self.pending_preloads.values():
+                if not future.done():
+                    future.cancel()
+            self.pending_preloads.clear()
+            self.pending_requests.clear()
+            self.active_preloads.clear()
+        self.executor.shutdown(wait=False)
+
+
 class AggregatedMapfArrowDataset(Dataset):
-    def __init__(self, folder_paths, device, batch_sizes, field_of_view_size=None):
+    def __init__(self, folder_paths, device, batch_sizes, field_of_view_size=None, max_concurrent_io=2):
         """
         Aggregates datasets from multiple folders into a single dataset.
 
@@ -15,17 +188,40 @@ class AggregatedMapfArrowDataset(Dataset):
             device (str): Device to load the data onto (e.g., 'cuda:0').
             batch_sizes (list): List of batch sizes for each dataset.
             field_of_view_size (int, optional): Number of FOV tokens to keep. If None, keeps all tokens.
+            max_concurrent_io (int): Maximum concurrent I/O operations across all loaders (default: 2).
         """
         assert len(folder_paths) == len(batch_sizes), "Each dataset must have a corresponding batch size."
+
+        # Create centralized preload coordinator
+        self.preload_coordinator = PreloadCoordinator(max_concurrent_io=max_concurrent_io)
+        
+        # Register the load function from MapfArrowDataset
+        self.preload_coordinator.register_load_function(MapfArrowDataset._get_data_from_file)
 
         self.datasets = []
         self.batch_sizes = batch_sizes
 
-        for folder_path, batch_size in zip(folder_paths, batch_sizes):
-            dataset = MapfArrowDataset(folder_path, device, batch_size, field_of_view_size=field_of_view_size)
+        # Create datasets and pass the coordinator
+        for idx, (folder_path, batch_size) in enumerate(zip(folder_paths, batch_sizes)):
+            dataset = MapfArrowDataset(
+                folder_path, 
+                device, 
+                batch_size, 
+                field_of_view_size=field_of_view_size,
+                preload_coordinator=self.preload_coordinator,
+                loader_id=idx
+            )
             self.datasets.append(dataset)
 
         self.device = device
+    
+    def __del__(self):
+        """Cleanup coordinator on deletion"""
+        try:
+            if hasattr(self, 'preload_coordinator'):
+                self.preload_coordinator.shutdown()
+        except:
+            pass
 
     def __iter__(self):
         """
