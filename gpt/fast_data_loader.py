@@ -168,7 +168,15 @@ class MapfArrowDataset(torch.utils.data.Dataset):
     
     def _start_preload(self, filename):
         """Start async preloading of next file using centralized coordinator with priority"""
-        # Wait for previous preload to finish
+        # Prevent duplicate preload requests for the same file
+        if self._preload_filename == filename and self._preload_future is not None:
+            # Already preloading this file, just update priority if needed
+            if self.preload_coordinator is not None:
+                batches_remaining = max(0, self._total_batches_in_file - self._current_batch_idx)
+                self.preload_coordinator.update_priority(self.loader_id, batches_remaining)
+            return
+        
+        # Wait for previous preload to finish (if different file)
         if self._preload_future is not None:
             try:
                 self._preload_future.result(timeout=0.1)
@@ -336,13 +344,14 @@ class MapfArrowDataset(torch.utils.data.Dataset):
                            self.agents_in_obs[i:i + self.batch_size],
                            self.agents_rel_coords[i:i + self.batch_size])
                     
-                    # Update priority as we progress through batches
+                    # Update priority periodically (every 10 batches) to avoid overhead
                     # Loaders closer to finishing get higher priority
                     if self.preload_coordinator is not None and self._preload_filename is not None:
-                        # Preload request exists, update priority based on batches remaining
-                        batches_remaining = self._total_batches_in_file - batch_idx - 1
-                        if batches_remaining >= 0:
-                            self.preload_coordinator.update_priority(self.loader_id, batches_remaining)
+                        # Only update priority periodically to avoid lock contention
+                        if batch_idx % 10 == 0 or batch_idx == self._total_batches_in_file - 1:
+                            batches_remaining = self._total_batches_in_file - batch_idx - 1
+                            if batches_remaining >= 0:
+                                self.preload_coordinator.update_priority(self.loader_id, batches_remaining)
                     
                     # On the last batch of current file, check if preload is ready
                     # If not ready yet, wait for it (but this is non-blocking for training
