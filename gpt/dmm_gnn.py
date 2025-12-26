@@ -357,6 +357,7 @@ class GraphEncoder(nn.Module):
 class GraphDecoder(nn.Module):
     """
     Graph decoder that processes agent features and messages to predict actions.
+    Uses shared (recursive) layers across all communication rounds for parameter efficiency.
     """
     def __init__(self, config):
         super().__init__()
@@ -365,19 +366,17 @@ class GraphDecoder(nn.Module):
         self.action_msg_feats = config.action_msg_feats
         self.n_comm_rounds = config.n_comm_rounds
         
-        # Message processing layers
+        # Shared message processing layer (applied recursively for each communication round)
         use_edge_attr = getattr(config, 'use_edge_attributes', True)
-        self.message_layers = nn.ModuleList([
-            GraphTransformerLayer(
-                in_channels=self.latent_embd,
-                out_channels=self.latent_embd,
-                num_heads=getattr(config, 'gnn_heads', 4),
-                dropout=config.dropout,
-                bias=config.bias,
-                use_edge_attr=use_edge_attr,
-                edge_dim=2  # dx, dy coordinates
-            ) for _ in range(self.n_comm_rounds)
-        ])
+        self.message_layer = GraphTransformerLayer(
+            in_channels=self.latent_embd,
+            out_channels=self.latent_embd,
+            num_heads=getattr(config, 'gnn_heads', 4),
+            dropout=config.dropout,
+            bias=config.bias,
+            use_edge_attr=use_edge_attr,
+            edge_dim=2  # dx, dy coordinates
+        )
         
         # Action prediction head
         self.action_proj = nn.Linear(self.latent_embd, self.action_msg_feats, bias=config.bias)
@@ -401,10 +400,10 @@ class GraphDecoder(nn.Module):
             agent_chat_ids, agents_rel_coords, device=device
         )
         
-        # Multiple communication rounds (reuse same graph structure)
-        for message_layer in self.message_layers:
-            # Message passing (graph structure is the same, only node features update)
-            node_features = message_layer(node_features, edge_index, edge_attr)
+        # Recursive communication rounds (shared weights across rounds)
+        for _ in range(self.n_comm_rounds):
+            # Message passing with shared layer (graph structure is the same, only node features update)
+            node_features = self.message_layer(node_features, edge_index, edge_attr)
         
         # Project to action features
         action_features = self.action_proj(node_features)
